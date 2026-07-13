@@ -123,6 +123,17 @@ class PolicyServerWrapper:
             )
         return self._norm_processors[cache_key]
 
+    def get_norm_processor(self, unnorm_key: Optional[str] = None) -> PolicyNormProcessor:
+        """Public accessor for the per-unnorm_key normalization processor.
+
+        Protocol adapters (e.g. the GR00T ZMQ compat server) use this to read
+        the training-time ``action_keys`` / ``state_keys`` and their per-key
+        dims so they can split the flat action chunk into named groups.
+        """
+        return self._get_processor(
+            unnorm_key if unnorm_key is not None else self._default_unnorm_key
+        )
+
     @property
     def metadata(self) -> Dict[str, Any]:
         """Model-invariant metadata; sent to client at websocket handshake."""

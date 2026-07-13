@@ -335,6 +335,14 @@ class PolicyNormProcessor:
         return list(self._state_keys)
 
     @property
+    def action_key_dims(self) -> Dict[str, int]:
+        return dict(self._action_key_dims)
+
+    @property
+    def state_key_dims(self) -> Dict[str, int]:
+        return dict(self._state_key_dims)
+
+    @property
     def unnorm_key(self) -> str:
         return self._unnorm_key
 

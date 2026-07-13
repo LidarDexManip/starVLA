@@ -30,6 +30,7 @@ diffusers
 timm
 tyro
 websockets
+pyzmq  # GR00T-protocol policy server (deployment/model_server/server_policy_gr00t_zmq.py)
 tdigest==0.5.2.2
 
 # env for qwen3.5 tip: flash-linear-attention may break older checkpoints (performance regression on previous ckpts)
