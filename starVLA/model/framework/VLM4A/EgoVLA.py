@@ -102,7 +102,8 @@ class EgoVLA(baseframework):
         self.config.framework.action_model.action_hidden_dim = self.vlm.hidden_size
 
         # Trajectory-decoder action head (vendored, checkpoint-compatible).
-        self.action_model = get_action_model(config=self.config)
+        # Match the backbone dtype so bf16 hidden states / proprio flow through it.
+        self.action_model = get_action_model(config=self.config).to(self.vlm.model_dtype)
 
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
         fw = self.config.framework

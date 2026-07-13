@@ -48,6 +48,7 @@ class _EgoVLA_VILA_Interface(nn.Module):
         base = config.framework.qwenvl.base_vlm  # points at the VILA-style checkpoint dir
         attn = getattr(config.framework.qwenvl, "attn_implementation", "sdpa")
         dtype = torch.bfloat16 if getattr(config.framework.qwenvl, "use_bf16", True) else torch.float32
+        self.model_dtype = dtype
 
         from transformers import AutoModelForCausalLM, AutoTokenizer, SiglipImageProcessor, SiglipVisionModel
 
