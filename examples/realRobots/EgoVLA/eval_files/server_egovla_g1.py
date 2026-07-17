@@ -5,28 +5,24 @@ UNCHANGED. EgoVLA's 48-dim camera-frame output is decoded to the bridge's
 joint-target action contract inside :class:`EgoVLAG1Policy` (EE pose -> pinocchio
 IK; MANO hand -> Inspire; see egovla_g1_policy.py).
 
-Requires the license-gated EgoVLA assets locally (see deployment/egovla/README.md):
+Requires the license-gated EgoVLA assets locally (see this folder's README.md):
 the EgoVLA checkpoint (``ego_vla_checkpoint``), MANO models, and the hand-retarget
 nets. Point ``--egovla_release`` (or env ``EGOVLA_RELEASE``) at the checkout.
 
 Example::
 
-    python deployment/egovla/server_egovla_g1.py --port 5555 \
+    python examples/realRobots/EgoVLA/eval_files/server_egovla_g1.py --port 5555 \
         --egovla_release /path/to/EgoVLA_Release
 """
 import argparse
 import logging
 import os
-import sys
 
 
 def main(args) -> None:
     if args.egovla_release:
         os.environ["EGOVLA_RELEASE"] = args.egovla_release
-    # make `deployment` / `starVLA` importable when run as a script
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-
-    from deployment.egovla.egovla_g1_policy import EgoVLAG1Policy
+    from examples.realRobots.EgoVLA.eval_files.egovla_g1_policy import EgoVLAG1Policy
     from deployment.model_server.tools.zmq_policy_server import ZmqGr00tPolicyServer
 
     policy = EgoVLAG1Policy(

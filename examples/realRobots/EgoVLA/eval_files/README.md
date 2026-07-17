@@ -7,7 +7,7 @@ with EgoVLA as the policy — the sim and bridge are used **unchanged**.
 ```text
 Isaac-Lab G1 (g1_redball_eval, unchanged)
   ── ZMQ ──►  GR00T-WBC-Bridge (unchanged, :5555 REQ)
-  ── ZMQ ──►  deployment/egovla/server_egovla_g1.py   ← this
+  ── ZMQ ──►  examples/realRobots/EgoVLA/eval_files/server_egovla_g1.py   ← this
 ```
 
 EgoVLA outputs a 48-dim camera-frame action (per hand: 3 wrist-translation +
@@ -33,7 +33,7 @@ an **EgoVLA_Release** checkout that contains them:
    and download from <https://mano.is.tue.mpg.de> (research license); place under
    `<EgoVLA_Release>/mano_v1_2/models/`.
 3. **Hand-retarget net** — `hand_actuation_net.pth` (from the EgoVLA release).
-   A copy is expected at `deployment/egovla/assets/hand_actuation_net.pth`
+   A copy is expected at `examples/realRobots/EgoVLA/eval_files/assets/hand_actuation_net.pth`
    (git-ignored here; copy it in).
 
 `g1_29dof_with_hand.urdf` (Unitree G1) ships in `assets/` — pinocchio needs only
@@ -53,7 +53,7 @@ pip install pinocchio smplx chumpy      # pytorch3d is already a starVLA dep
 
 ```bash
 # 1) EgoVLA policy server on :5555
-python deployment/egovla/server_egovla_g1.py \
+python examples/realRobots/EgoVLA/eval_files/server_egovla_g1.py \
     --port 5555 --egovla_release /path/to/EgoVLA_Release
 
 # 2) then launch the G1 sim + GR00T-WBC-Bridge as usual
