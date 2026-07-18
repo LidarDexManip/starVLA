@@ -18,6 +18,11 @@ import argparse
 import logging
 import os
 
+try:  # standalone script: bootstrap the repo root onto sys.path (repo isn't pip-installed)
+    import _bootstrap  # noqa: F401
+except ModuleNotFoundError:  # imported as a package module: root already on sys.path
+    pass
+
 
 def main(args) -> None:
     if args.egovla_release:
