@@ -47,7 +47,16 @@ from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
 
-deepspeed_plugin = DeepSpeedPlugin()
+# Only engage DeepSpeed when the launcher asked for it (accelerate launch with
+# a deepspeed config exports ACCELERATE_USE_DEEPSPEED=true). Passing a plugin
+# unconditionally forces DeepSpeed on (accelerate itself flips
+# ACCELERATE_USE_DEEPSPEED to true when a plugin is provided), which breaks
+# plain-accelerate runs: single-GPU full fine-tunes that rely on
+# accumulate()-based grad accumulation (ACCELERATE_GRADIENT_ACCUMULATION_STEPS)
+# or bitsandbytes optimizers (e.g. the QwenOFT recipe) must run without ZeRO.
+deepspeed_plugin = (
+    DeepSpeedPlugin() if os.environ.get("ACCELERATE_USE_DEEPSPEED", "false") == "true" else None
+)
 accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
 accelerator.print(accelerator.state)
 
@@ -86,16 +95,40 @@ def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
 
 
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
-    """Set optimizer and scheduler."""
+    """Set optimizer and scheduler.
+
+    ``trainer.optimizer.name`` selects the optimizer (default ``adamw``):
+      - ``adamw``            : torch.optim.AdamW(fused=True)  — fp32 states
+      - ``paged_adamw_8bit`` : bitsandbytes PagedAdamW8bit    — 8-bit states on
+        GPU, paged to host RAM under pressure. Fits e.g. a 2B full fine-tune on
+        a single 24GB card without DeepSpeed/ZeRO (QwenOFT recipe).
+      - ``adamw_8bit``       : bitsandbytes AdamW8bit (non-paged)
+    """
     param_groups = build_param_lr_groups(model=model, cfg=cfg)
-    optimizer = torch.optim.AdamW(
-        param_groups,
+    # Plain attribute access: cfg may be an AccessTrackedConfig proxy here,
+    # which OmegaConf.select() rejects (it probes DictConfig internals).
+    _opt_cfg = getattr(cfg.trainer, "optimizer", None)
+    opt_name = str(getattr(_opt_cfg, "name", None) or "adamw").lower()
+    opt_kwargs = dict(
         lr=cfg.trainer.learning_rate.base,
         betas=tuple(cfg.trainer.optimizer.betas),
         weight_decay=cfg.trainer.optimizer.weight_decay,
         eps=cfg.trainer.optimizer.eps,
-        fused=True,
     )
+    if opt_name in ("paged_adamw_8bit", "adamw_8bit"):
+        try:
+            import bitsandbytes as bnb
+        except ImportError as e:
+            raise ImportError(
+                f"trainer.optimizer.name={opt_name!r} needs bitsandbytes: pip install bitsandbytes"
+            ) from e
+        opt_cls = bnb.optim.PagedAdamW8bit if opt_name == "paged_adamw_8bit" else bnb.optim.AdamW8bit
+        optimizer = opt_cls(param_groups, **opt_kwargs)
+    elif opt_name == "adamw":
+        optimizer = torch.optim.AdamW(param_groups, fused=True, **opt_kwargs)
+    else:
+        raise ValueError(f"Unknown trainer.optimizer.name: {opt_name!r} (adamw | paged_adamw_8bit | adamw_8bit)")
+    logger.info(f"Optimizer: {type(optimizer).__module__}.{type(optimizer).__name__}")
 
     if dist.is_initialized() and dist.get_rank() == 0:
         for group in optimizer.param_groups:

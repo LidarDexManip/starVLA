@@ -1,0 +1,93 @@
+# QwenOFT recipe for G1 + Inspire piston pick-and-place.
+# Ported from the reference checkpoint birbirll/g1-inspire-piston-starvla-oft
+# (its config.full.yaml / starvla_files are the source of truth for every
+# value below). Qwen3-VL-2B backbone + MLP L1-regression head, FULL fine-tune,
+# vision+language-only (no proprio state), color jitter in the DataConfig.
+#
+# Run via run_starvla_QwenOFT_piston_train.sh — PLAIN accelerate, NO DeepSpeed.
+# Grad accumulation is real here (accelerate accumulate(); the trainer gates
+# completed_steps / lr_scheduler.step() on sync_gradients), supplied through
+# ACCELERATE_GRADIENT_ACCUMULATION_STEPS by the launcher.
+
+run_id: starvla_qwenoft_piston_g1
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: starVLA_unitree_g1_piston
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenOFT
+  qwenvl:
+    # HF id auto-downloads; override with a local path via the launcher.
+    # Plain -Instruct works: QwenOFT uses "🔍" as its action token, so no
+    # special -Action checkpoint is needed.
+    base_vlm: Qwen/Qwen3-VL-2B-Instruct
+    attn_implementation: sdpa
+    # Live grad-ckpt switch (trainer.gradient_checkpointing is dead config).
+    enable_gradient_checkpointing: true
+  action_model:
+    action_model_type: MLP
+    action_dim: 30      # left_arm7 + right_arm7 + left_hand6 + right_hand6 + base_height1 + navigate3
+    state_dim: 0        # vision+language-only (MLP head ignores state_dim anyway)
+    action_horizon: 30  # == len(action_indices) in PistonPickPlaceG1OFTDataConfig
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    # OFF ON PURPOSE: with proprio packed, the policy can minimize train loss
+    # from state alone and ignore the camera — then never correct visually in
+    # closed loop. Vision+language-only forces it to look.
+    include_state: false
+    data_root_dir: /home/jren313/Datasets/pickplace_hf
+    data_mix: unitree_g1_piston_pnp
+    lerobot_version: v2.0             # v2.1 layout reads fine via the v2.0 path
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 8          # micro-batch; eff. batch = 8 * accum(4) = 32
+    load_all_data_for_training: true
+    obs_image_size: [224, 224]
+    delete_pause_frame: false
+    video_backend: decord             # torchvision_av broken here (VideoReader removed)
+    num_workers: 4
+
+trainer:
+  max_train_steps: 10000
+  num_warmup_steps: 50
+  save_interval: 1000
+  eval_interval: 500
+  learning_rate:
+    base: 2.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  # FULL fine-tune on purpose: QwenOFT has no separate projector (the action
+  # token rides through the VLM), so freezing the backbone leaves nothing to
+  # adapt the visual features — train everything.
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  # Informational only — the Accelerator is built at module import (before the
+  # cfg loads), so the real value comes from ACCELERATE_GRADIENT_ACCUMULATION_STEPS
+  # exported by the launcher. Keep the two in sync.
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: true
+
+  optimizer:
+    # bitsandbytes PagedAdamW8bit: 8-bit optimizer states on the GPU, paged to
+    # host RAM under pressure — fits the 2B full fine-tune on one 24GB card
+    # with no DeepSpeed/ZeRO. Selected by name in setup_optimizer_and_scheduler.
+    name: paged_adamw_8bit
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  save_format: pt

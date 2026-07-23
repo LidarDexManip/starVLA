@@ -74,8 +74,11 @@ class PolicyServerWrapper:
         self._model_cfg = model_cfg
 
         # action_chunk_size = future_action_window_size + 1 (matches old client).
-        action_model_cfg = model_cfg["framework"]["action_model"]
-        
+        # QwenOFT-style configs nest these under framework.action_model; PI0/PI05
+        # configs put action_horizon directly under framework.
+        framework_cfg = model_cfg["framework"]
+        action_model_cfg = framework_cfg.get("action_model", framework_cfg)
+
         if "action_horizon" in action_model_cfg:
             self._action_chunk_size = int(action_model_cfg["action_horizon"])
         elif "future_action_window_size" in action_model_cfg:

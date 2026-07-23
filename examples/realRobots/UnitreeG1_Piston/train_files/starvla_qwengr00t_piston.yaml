@@ -1,0 +1,66 @@
+run_id: starvla_qwengr00t_piston_g1
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: starVLA_unitree_g1_piston
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T
+  qwenvl:
+    # HF id auto-downloads; override with a local path via the launcher.
+    base_vlm: Qwen/Qwen3-VL-4B-Instruct
+    attn_implementation: sdpa
+    vl_hidden_dim: 2048
+  action_model:
+    # Exact piston89 dims (GR00T head has no fixed 32-dim padding like PI05).
+    action_dim: 26
+    state_dim: 29
+    # Must equal len(action_indices) in the piston DataConfig (range(10)).
+    action_horizon: 10
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: playground/Datasets/piston89
+    data_mix: piston_g1_inspire
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 4
+    load_all_data_for_training: true
+    obs_image_size: [224, 224]
+    delete_pause_frame: false
+    video_backend: decord
+
+trainer:
+  max_train_steps: 30000
+  num_warmup_steps: 2000
+  save_interval: 5000
+  eval_interval: 100000000
+  learning_rate:
+    base: 2.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  save_format: pt
