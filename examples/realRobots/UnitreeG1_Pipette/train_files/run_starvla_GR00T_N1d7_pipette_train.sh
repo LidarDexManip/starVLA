@@ -1,40 +1,36 @@
 #!/usr/bin/env bash
 # Fine-tune GR00T-N1.7 (Cosmos-Reason2-2B backbone + 32-layer alternate-VL
-# flow-matching DiT head) on the G1/Inspire piston pick-and-place dataset,
-# INITIALISED DIRECTLY from the public nvidia/GR00T-N1.7-3B parameters.
+# flow-matching DiT head) on the G1/Inspire PIPETTE TIP dataset, INITIALISED
+# DIRECTLY from the public nvidia/GR00T-N1.7-3B parameters.
+#
+# Dataset: jren313/g1-pipette-tip-teleop (LeRobot v2.1, 64 eps / 56,742 frames
+# @ 60 fps, single ego view). Fetch it once with:
+#   hf download jren313/g1-pipette-tip-teleop --repo-type dataset \
+#     --local-dir "${DATA_ROOT:-$HOME/Datasets}/g1-pipette-tip-teleop"
 #
 # Framework CosmosGR00TN1d7 loads all 1031 checkpoint tensors 1:1 (backbone +
-# head, verified) then fine-tunes on starVLA data through starVLA's usual
-# pipeline (same data registry / deploy server as the QwenOFT recipe).
+# head, verified) then fine-tunes through starVLA's usual pipeline.
 #
-# Differences vs the QwenOFT launcher:
 #   - Backbone is Cosmos-Reason2-2B (Qwen3-VL), LLM truncated to select_layer=16.
-#   - Head is flow-matching (diffusion) and CONDITIONS ON STATE -> include_state
-#     is TRUE (QwenOFT used false).
-#   - The model is ~3.1B params. Full fine-tune fits the 96GB Blackwell card.
-#     On 24GB: set FREEZE_BACKBONE=true (trains the 1.6B head only, VL features
-#     detached) and/or PER_DEVICE_BATCH_SIZE=1.
+#   - Head is flow-matching and CONDITIONS ON STATE -> include_state is TRUE.
+#   - ~3.1B params. Full fine-tune fits the 96GB Blackwell card. On 24GB set
+#     FREEZE_BACKBONE=true (trains the 1.6B head only, VL features detached)
+#     and/or PER_DEVICE_BATCH_SIZE=1.
 #
-# Still PLAIN accelerate + bitsandbytes PagedAdamW8bit, NO DeepSpeed (accum via
+# PLAIN accelerate + bitsandbytes PagedAdamW8bit, NO DeepSpeed (accum via
 # ACCELERATE_GRADIENT_ACCUMULATION_STEPS; do not mix accum with DeepSpeed).
 #
 # INITIALISATION: leaving PRETRAINED_CHECKPOINT empty (the default) trains from
 # the OFFICIAL nvidia/GR00T-N1.7-3B weights alone. Set it ONLY to continue from a
 # previous starVLA run -- it is applied AFTER the N1.7 load and overwrites it.
 #
-# Three-camera long-horizon variant (ego + both wrists):
-#   CONFIG_YAML=examples/realRobots/UnitreeG1_Piston/train_files/starvla_gr00t_n1d7_piston_wristcam.yaml \
-#   DATA_ROOT=~/Datasets DATA_MIX=unitree_g1_piston_wristcam_n1d7 \
-#   PER_DEVICE_BATCH_SIZE=4 GRAD_ACCUM_STEPS=8 GRASP_LOSS_WEIGHT=3.0 \
-#   RUN_ID=starvla_gr00t_n1d7_piston_wristcam bash "$0"
+# Action/state spaces here are 24/17, NOT the piston recipe's 30/29 -- several
+# hand channels in this recording are constant and would reach the head
+# un-normalised. See data_registry/data_config.py for the measurement.
 #
-# EXTRA ARGS: anything after the script name is forwarded verbatim to
-# train_starvla.py, e.g. `bash "$0" --trainer.optimizer.name adamw`. Until
-# 2026-08-06 they were SILENTLY DROPPED — the script took "$@" and never
-# passed it on, so a run launched with `--trainer.optimizer.name adamw` and
-# per-module LR overrides used the yaml's values instead and nobody could see
-# it in the console output. CLI overrides beat the yaml (OmegaConf dotlist
-# merge), so they must arrive last.
+# Smoke test before committing a GPU (1 step, tiny batch, no wandb):
+#   MAX_TRAIN_STEPS=1 PER_DEVICE_BATCH_SIZE=1 GRAD_ACCUM_STEPS=1 \
+#   NUM_WORKERS=0 RUN_ID=pipette_smoke bash "$0"
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,31 +40,13 @@ cd "${REPO_ROOT}"
 # -- Runtime / hardware ------------------------------------------------------
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
-# OFFLINE BY DEFAULT, and not for tidiness: the backbone id
-# nvidia/Cosmos-Reason2-2B is a GATED repo, so an un-authenticated box does not
-# fail with "downloading..." — it 401s several minutes into startup with a
-# GatedRepoError that reads like a permissions bug in this framework. Every
-# weight this launcher needs is pre-staged in the HF cache, so there is nothing
-# legitimate to fetch; offline turns a confusing 401 into "not in cache", which
-# names the actual problem. Set HF_OFFLINE=0 to allow the hub (needs `hf auth
-# login` with access to the gated repo).
-if [[ "${HF_OFFLINE:-1}" == "1" ]]; then
-  export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-fi
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 NUM_PROCESSES="${NUM_PROCESSES:-1}"
-# DDP is opt-in on the accelerate CLI: --num_processes alone has been enough in
-# some versions and silently single-process in others, and "silently one GPU"
-# looks exactly like a slow run rather than a misconfiguration. State it.
-# NOTE: CUDA_VISIBLE_DEVICES above defaults to "0", so a multi-GPU run must set
-# it too — NUM_PROCESSES=8 with the default mask would put 8 processes on GPU 0.
-MULTI_GPU_ARGS=()
-if [[ "${NUM_PROCESSES}" -gt 1 ]]; then MULTI_GPU_ARGS+=(--multi_gpu); fi
 
 # -- Data / model ------------------------------------------------------------
-CONFIG_YAML="${CONFIG_YAML:-examples/realRobots/UnitreeG1_Piston/train_files/starvla_gr00t_n1d7_piston.yaml}"
-DATA_ROOT="${DATA_ROOT:-${HOME}/Datasets/pickplace_hf}"
-DATA_MIX="${DATA_MIX:-unitree_g1_piston_pnp_n1d7}"
+CONFIG_YAML="${CONFIG_YAML:-examples/realRobots/UnitreeG1_Pipette/train_files/starvla_gr00t_n1d7_pipette.yaml}"
+DATA_ROOT="${DATA_ROOT:-${HOME}/Datasets}"
+DATA_MIX="${DATA_MIX:-unitree_g1_pipette_n1d7}"
 BASE_VLM="${BASE_VLM:-nvidia/Cosmos-Reason2-2B}"
 # N1.7 checkpoint dir (with model-*.safetensors). Empty => auto-find in the HF
 # cache (models--nvidia--GR00T-N1.7-3B). Download once with:
@@ -81,23 +59,18 @@ PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT-}"
 # light; recommended on <=24GB). Full fine-tune (false) needs the 96GB card.
 FREEZE_BACKBONE="${FREEZE_BACKBONE:-false}"
 
-# Up-weight the (short) plunger-press phase in the loss. 1.0 = off. Use 3.0 ONLY
-# with DATA_MIX=unitree_g1_piston_longhorizon_n1d7; on the pnp mix action dim 25
-# is constant so the flag would fire on every frame (a silent no-op).
-# EMPTY = "whatever the YAML says", and that default matters: these are passed
-# on the accelerate command line, where they OVERRIDE the config file. With a
-# 1.0 default they silently defeated starvla_gr00t_n1d7_piston_wristcam.yaml's
-# `grasp_loss_weight: 3.0` on every launch that did not export the variable —
-# a run that looks correct, is configured correctly on disk, and trains without
-# the press weighting anyway (caught 2026-08-06, mid-run, on the B200 box).
-# Set them only to OVERRIDE the yaml.
-GRASP_LOSS_WEIGHT="${GRASP_LOSS_WEIGHT-}"
-GRASP_WEIGHT_DIM="${GRASP_WEIGHT_DIM-}"
-GRASP_WEIGHT_THRESH="${GRASP_WEIGHT_THRESH-}"
+# Up-weight the (short) tip-ejector press in the loss. 1.0 = off (default:
+# get a baseline first). Dim 18 == action.hand_right[4] == thumb_bend; under
+# min_max on 0..1000 the normalised rest value is 0.0 and a +0.04 threshold
+# (raw > 520) flags ~1.7% of frames. Try GRASP_LOSS_WEIGHT=3.0 if a baseline
+# run under-presses the ejector.
+GRASP_LOSS_WEIGHT="${GRASP_LOSS_WEIGHT:-1.0}"
+GRASP_WEIGHT_DIM="${GRASP_WEIGHT_DIM:-18}"
+GRASP_WEIGHT_THRESH="${GRASP_WEIGHT_THRESH:-0.04}"
 
 RUN_ROOT_DIR="${RUN_ROOT_DIR:-outputs/starvla}"
-RUN_ID="${RUN_ID:-starvla_gr00t_n1d7_piston_g1}"
-WANDB_PROJECT="${WANDB_PROJECT:-starVLA_unitree_g1_piston}"
+RUN_ID="${RUN_ID:-starvla_gr00t_n1d7_pipette_g1}"
+WANDB_PROJECT="${WANDB_PROJECT:-starVLA_unitree_g1_pipette}"
 WANDB_ENTITY="${WANDB_ENTITY:-jren313-georgia-institute-of-technology}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 
@@ -131,16 +104,6 @@ echo "[launcher] framework=CosmosGR00TN1d7 base_vlm='${BASE_VLM}' freeze_backbon
      "(plain accelerate, no DeepSpeed; optimizer=paged_adamw_8bit; loads nvidia/GR00T-N1.7-3B)"
 
 EXTRA_ARGS=()
-# Only override the yaml when explicitly asked (see the block above).
-if [[ -n "${GRASP_LOSS_WEIGHT}" ]]; then
-  EXTRA_ARGS+=(--framework.action_model.grasp_loss_weight "${GRASP_LOSS_WEIGHT}")
-fi
-if [[ -n "${GRASP_WEIGHT_DIM}" ]]; then
-  EXTRA_ARGS+=(--framework.action_model.grasp_weight_dim "${GRASP_WEIGHT_DIM}")
-fi
-if [[ -n "${GRASP_WEIGHT_THRESH}" ]]; then
-  EXTRA_ARGS+=(--framework.action_model.grasp_weight_thresh "${GRASP_WEIGHT_THRESH}")
-fi
 if [[ -n "${PRETRAINED_N1D7}" ]]; then
   EXTRA_ARGS+=(--framework.pretrained_gr00t_n1d7 "${PRETRAINED_N1D7}")
 fi
@@ -150,13 +113,15 @@ fi
 
 accelerate launch \
   --num_processes "${NUM_PROCESSES}" \
-  "${MULTI_GPU_ARGS[@]}" \
   --mixed_precision no \
   starVLA/training/train_starvla.py \
   --config_yaml "${CONFIG_YAML}" \
   --framework.qwenvl.base_vlm "${BASE_VLM}" \
   --framework.tune_llm "${TUNE_LLM}" \
   --framework.tune_visual "${TUNE_VISUAL}" \
+  --framework.action_model.grasp_loss_weight "${GRASP_LOSS_WEIGHT}" \
+  --framework.action_model.grasp_weight_dim "${GRASP_WEIGHT_DIM}" \
+  --framework.action_model.grasp_weight_thresh "${GRASP_WEIGHT_THRESH}" \
   --datasets.vla_data.data_root_dir "${DATA_ROOT}" \
   --datasets.vla_data.data_mix "${DATA_MIX}" \
   --datasets.vla_data.include_state true \
@@ -176,5 +141,4 @@ accelerate launch \
   --run_id "${RUN_ID}" \
   --wandb_project "${WANDB_PROJECT}" \
   --wandb_entity "${WANDB_ENTITY}" \
-  "${EXTRA_ARGS[@]}" \
-  "$@"
+  "${EXTRA_ARGS[@]}"

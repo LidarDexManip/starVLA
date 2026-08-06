@@ -111,6 +111,10 @@ class CosmosGR00TN1d7DefaultConfig:
             "noise_beta_beta": 1.0,
             "noise_s": 0.999,
             "state_dropout_prob": 0.2,
+            # Press-phase frame weighting (see `_frame_weights`). 1.0 == disabled.
+            "grasp_loss_weight": 1.0,
+            "grasp_weight_dim": 25,
+            "grasp_weight_thresh": -0.143,
             "diffusion_model_cfg": {
                 "num_attention_heads": 32,
                 "attention_head_dim": 48,
@@ -158,6 +162,12 @@ class CosmosGR00T_N1d7(baseframework):
         self.max_state_dim = int(am.max_state_dim)
         self.state_history_length = int(am.get("state_history_length", 1))
         self.embodiment_id_value = int(self.config.framework.get("embodiment_id", 25))
+
+        # press-phase frame weighting (training only; see `_frame_weights`)
+        self.grasp_loss_weight = float(am.get("grasp_loss_weight", 1.0))
+        self.grasp_weight_dim = int(am.get("grasp_weight_dim", 25))
+        self.grasp_weight_thresh = float(am.get("grasp_weight_thresh", -0.143))
+        self._grasp_weight_logged = False
 
         # --- load N1.7 pretrained weights (backbone + head) ---
         ckpt = self._resolve_n1d7_path(self.config.framework.get("pretrained_gr00t_n1d7", None))
@@ -315,7 +325,49 @@ class CosmosGR00T_N1d7(baseframework):
             t, d = a.shape
             actions[i, H - t:, :d] = a
             mask[i, H - t:, :d] = 1.0
+        if self.grasp_loss_weight != 1.0:
+            mask = mask * self._frame_weights(actions, mask)
         return actions, mask
+
+    def _frame_weights(self, actions, mask):
+        """[B,H,132] -> [B,H,1] per-frame loss weight, folded into ``action_mask``.
+
+        The plunger press is a SHORT phase (~21% of frames on the long-horizon
+        piston set) so a uniform mean averages it away and the press is under-fit.
+        A frame is flagged when the right-hand thumb channel (``grasp_weight_dim``,
+        25 == ``action.right_hand[5]`` in the 30-dim
+        ``left_arm7|right_arm7|left_hand6|right_hand6|base_height1|navigate3``
+        layout) sits above ``grasp_weight_thresh``, i.e. lifted off its rest value.
+        Flagged frames get ``grasp_loss_weight`` on ALL of their action dims.
+
+        Folding the weight into the mask is exact rather than approximate: the head
+        computes ``(per_elem * action_mask).sum() / action_mask.sum()``, so a scaled
+        mask yields precisely the proposed weighted mean ``L = Σ wₜ·err / Σ wₜ`` —
+        and, being a weighted MEAN, it leaves the loss on the same scale as the
+        unweighted run, so LR / grad-clip carry over unchanged.
+        """
+        d = self.grasp_weight_dim
+        valid = mask[:, :, d] > 0  # excludes the zero-pad rows of short chunks
+        press = (actions[:, :, d] > self.grasp_weight_thresh) & valid
+        if not self._grasp_weight_logged:
+            self._grasp_weight_logged = True
+            frac = (press.sum() / valid.sum().clamp(min=1)).item()
+            logger.info(
+                f"[press-frame weighting] dim={d} thresh={self.grasp_weight_thresh} "
+                f"weight={self.grasp_loss_weight} -> {frac * 100:.1f}% of frames "
+                f"flagged in the first batch."
+            )
+            if frac < 0.01 or frac > 0.99:
+                logger.warning(
+                    "[press-frame weighting] the flag fires on ~all or ~no frames, so "
+                    "the weighted mean collapses back to the plain mean (a silent "
+                    f"no-op). Check that action dim {d} actually VARIES in this "
+                    "dataset: when q01 == q99 StateActionTransform passes the raw "
+                    "value through un-normalised, so the threshold is compared "
+                    "against a raw number."
+                )
+        w = 1.0 + (self.grasp_loss_weight - 1.0) * press.to(actions.dtype)
+        return w.unsqueeze(-1)  # [B,H,1] -> broadcasts over all action dims
 
     def _prep_state(self, state_list, batch_size, device, dtype):
         """list[np [T,sdim] or [sdim]] (or None) -> state[B, state_history_length, 132].
@@ -366,6 +418,34 @@ class CosmosGR00T_N1d7(baseframework):
         return {"action_loss": loss}
 
     # ---------------------------------------------------------------- inference
+    def _check_num_views(self, images) -> None:
+        """Warn once if the eval client sends a different camera count than training.
+
+        Nothing downstream identifies a view by name — the processor just emits one
+        image-token block per PIL image in list order — so a client that sends the
+        ego view alone to a 3-view checkpoint produces a valid forward pass on a
+        third of the expected tokens, i.e. a SILENT out-of-distribution failure that
+        looks like a merely bad policy. ``datasets.vla_data.expected_num_views``
+        (set it to ``len(video_keys)`` of the training DataConfig) turns that into a
+        loud message. Leave it unset to skip the check.
+        """
+        if getattr(self, "_num_views_checked", False):
+            return
+        self._num_views_checked = True
+        expected = getattr(self.config.datasets.vla_data, "expected_num_views", None)
+        if not expected:
+            return
+        got = len(images[0]) if images and isinstance(images[0], (list, tuple)) else 1
+        if got != int(expected):
+            logger.error(
+                f"[camera contract] this checkpoint was trained on {expected} camera "
+                f"view(s) but the eval client sent {got}. The forward pass will still "
+                "succeed — with the wrong number of image tokens — so expect "
+                "confidently wrong actions. Fix the client, not this check."
+            )
+        else:
+            logger.info(f"[camera contract] {got} camera view(s), matches training.")
+
     @torch.inference_mode()
     def predict_action(self, examples: List[dict], **kwargs):
         if not isinstance(examples, list):
@@ -373,6 +453,7 @@ class CosmosGR00T_N1d7(baseframework):
         images = [to_pil_preserve(ex["image"]) for ex in examples]
         instructions = [ex["lang"] for ex in examples]
         state = [ex["state"] for ex in examples] if "state" in examples[0] else None
+        self._check_num_views(images)
 
         train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
         if train_obs_image_size:

@@ -44,10 +44,12 @@ def main(args) -> None:
     contract = policy.get_modality_config()
     logging.warning(
         "[TRAIN/TEST CONSISTENCY CHECK] serving ckpt=%s over the GR00T ZMQ protocol. "
-        "Clients must send state keys %s (flattened in this order, dims %s) and will "
-        "receive action keys %s (dims %s), chunk_size=%s. Cross-check against the "
-        "client's bridge profile.",
+        "Clients must send camera views %s (IN THIS ORDER — view identity is "
+        "positional, so a reordered or partial set is misread silently) and state "
+        "keys %s (flattened in this order, dims %s), and will receive action keys %s "
+        "(dims %s), chunk_size=%s. Cross-check against the client's bridge profile.",
         args.ckpt_path,
+        contract["video_keys"] or "<unspecified>",
         contract["state_keys"],
         contract["state_key_dims"],
         contract["action_keys"],

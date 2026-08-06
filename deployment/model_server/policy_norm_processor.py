@@ -368,6 +368,16 @@ class PolicyNormProcessor:
         return list(self._state_keys)
 
     @property
+    def video_keys(self) -> List[str]:
+        """Camera views in TRAINING order (``DataConfig.video_keys``).
+
+        The order is a serve-time contract: nothing downstream identifies a view
+        by name, so the server must lay images out exactly as training did.
+        Empty only for a DataConfig that declares no video keys.
+        """
+        return list(self._video_keys)
+
+    @property
     def action_key_dims(self) -> Dict[str, int]:
         return dict(self._action_key_dims)
 

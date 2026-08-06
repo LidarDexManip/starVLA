@@ -111,10 +111,13 @@ class Gr00tCompatPolicy:
         self._state_key_dims: Dict[str, int] = dict(proc.state_key_dims)
         self._action_keys: List[str] = list(proc.action_keys)
         self._action_key_dims: Dict[str, int] = dict(proc.action_key_dims)
+        # Camera views in TRAINING order; see `_resolve_video_order`.
+        self._video_keys: List[str] = list(getattr(proc, "video_keys", []))
 
         logger.info(
-            "Gr00tCompatPolicy ready: unnorm_key=%s state order=%s action split=%s",
+            "Gr00tCompatPolicy ready: unnorm_key=%s video order=%s state order=%s action split=%s",
             self._unnorm_key,
+            [k.split(".", 1)[-1] for k in self._video_keys],
             [(k.split(".", 1)[-1], self._state_key_dims.get(k, 1)) for k in self._state_keys],
             [(k.split(".", 1)[-1], self._action_key_dims.get(k, 1)) for k in self._action_keys],
         )
@@ -139,6 +142,9 @@ class Gr00tCompatPolicy:
         """Not a real GR00T ModalityConfig — a plain-dict contract summary that
         lets clients sanity-check key order and dims at handshake time."""
         return {
+            # Ordered camera views; clients MUST send exactly these, in this
+            # order, because view identity is positional (see obs_to_example).
+            "video_keys": [k.split(".", 1)[-1] for k in self._video_keys],
             "state_keys": self._state_keys,
             "state_key_dims": self._state_key_dims,
             "action_keys": self._action_keys,
@@ -148,11 +154,50 @@ class Gr00tCompatPolicy:
 
     # -- Conversions -----------------------------------------------------------
 
+    def _resolve_video_order(self, video: Dict[str, Any]) -> List[str]:
+        """Return the observation's view keys in TRAINING order.
+
+        Ordering by ``video.values()`` would make the layout depend on the
+        client's dict insertion order, which is not a contract anybody states:
+        the model has no per-view encoder and no view embedding, so position in
+        the list is the ONLY thing identifying a camera. A client that inserted
+        the wrist views first would silently hand the policy a wrist frame where
+        it expects the ego view — a valid forward pass with confidently wrong
+        actions and no error anywhere.
+
+        So the checkpoint's own ``DataConfig.video_keys`` decides, and a missing
+        view is an error rather than a short list. Checkpoints whose DataConfig
+        declares no video keys (or single-view ones whose client uses a
+        different short name) keep the previous insertion-order behaviour.
+        """
+        declared = [k.split(".", 1)[-1] for k in self._video_keys]
+        if not declared:
+            return list(video)
+        missing = [k for k in declared if k not in video]
+        if missing:
+            if len(declared) == 1 and len(video) == 1:
+                # Single-view checkpoint, client used another short name for the
+                # one stream. Unambiguous, so accept it (GWB-era clients do this).
+                return list(video)
+            raise KeyError(
+                f"observation video is missing {missing} — this checkpoint was "
+                f"trained on views {declared} (in that order) and nothing "
+                f"downstream identifies a view by name, so a partial set would "
+                f"be silently misread. Received: {sorted(video)}"
+            )
+        extra = [k for k in video if k not in declared]
+        if extra:
+            logger.warning(
+                "observation carries views %s that the checkpoint was not trained "
+                "on; ignoring them (trained views: %s)", extra, declared,
+            )
+        return declared
+
     def obs_to_example(self, observation: Dict[str, Any]) -> Dict[str, Any]:
         video = observation.get("video")
         if not isinstance(video, dict) or not video:
             raise KeyError("observation is missing the 'video' modality dict")
-        images = [_latest_image(v) for v in video.values()]
+        images = [_latest_image(video[k]) for k in self._resolve_video_order(video)]
 
         example: Dict[str, Any] = {
             "image": images,

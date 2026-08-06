@@ -39,6 +39,7 @@ from starVLA.dataloader.gr00t_lerobot.transform.state_action import (
 )
 from starVLA.dataloader.gr00t_lerobot.transform.video import (
     VideoColorJitter,
+    VideoResize,
     VideoToNumpy,
     VideoToTensor,
 )
@@ -269,6 +270,93 @@ class PistonPickPlaceG1GR00TN1d7DataConfig(PistonPickPlaceG1OFTDataConfig):
     """
 
 
+class PistonWristCamG1GR00TN1d7DataConfig(PistonPickPlaceG1GR00TN1d7DataConfig):
+    """THREE-camera long-horizon variant — HF dataset
+    ``birbirll/g1-inspire-piston-longhorizon-v3-wristcam`` (LeRobot v2.1, 67
+    episodes / 45,943 frames @ 50 fps).
+
+    Same 29-dim state / 30-dim action / instruction as
+    ``g1-inspire-piston-longhorizon``; what is new are two wrist streams:
+
+      ego_view          240x424   (head D435)
+      left_wrist_view   480x640
+      right_wrist_view  480x640
+
+    The order below is a TRAIN/INFERENCE CONTRACT — the eval client must send
+    images in exactly this order, because nothing downstream identifies a view
+    by name: the dataloader concatenates them positionally into ``ex["image"]``
+    and the Cosmos processor emits one 64-token block per image in list order.
+
+    Resolution is NOT a contract: ``LeRobotSingleDataset._pack_sample`` resizes
+    every view to 224x224, and the Cosmos processor's ``shortest_edge`` (65536
+    px) floor then upscales that to a 16x16 patch grid — so each view costs 64
+    image tokens regardless of its native size, and 3 views cost 192 (vs 64).
+    """
+
+    video_keys = [
+        "video.ego_view",
+        "video.left_wrist_view",
+        "video.right_wrist_view",
+    ]
+
+    # Common size every view is resampled to before the views are stacked. It
+    # matches what LeRobotSingleDataset._pack_sample resizes to anyway, so the
+    # frame is only resampled once.
+    view_resize_hw = (224, 224)
+
+    def transform(self):
+        """Same recipe as the single-view N1.7 config, restructured for views of
+        DIFFERENT resolutions.
+
+        ``VideoTransform.apply`` concatenates every key in ``apply_to`` along the
+        frame axis before running the underlying op, so a shared transform
+        requires all of its views to have identical H x W. Here they do not --
+        ego_view is 240x424 while both wrist views are 480x640 -- which fails in
+        ``np.concatenate`` with "all the input array dimensions except for the
+        concatenation axis must match exactly".
+
+        So the two DETERMINISTIC transforms get one instance per view (a
+        single-key concat is a no-op) and bring every view to a common size;
+        from VideoColorJitter onward the shapes match and the views share a
+        transform again. Two ordering constraints are load-bearing:
+
+          * Resize must come AFTER VideoToTensor -- ``VideoToTensor.check_input``
+            asserts the incoming resolution still equals the dataset metadata's,
+            so resizing first trips that assert.
+          * VideoColorJitter must stay SHARED across the three views. The concat
+            is what makes a single ``T.ColorJitter`` parameter draw cover every
+            view; splitting it per view would give each camera an independently
+            jittered colour, which is a different augmentation.
+        """
+        h, w = self.view_resize_hw
+        per_view = []
+        for key in self.video_keys:
+            per_view.append(VideoToTensor(apply_to=[key]))
+            per_view.append(VideoResize(apply_to=[key], height=h, width=w, interpolation="linear"))
+        return ComposedModalityTransform(
+            transforms=[
+                *per_view,
+                VideoColorJitter(
+                    apply_to=self.video_keys,
+                    brightness=0.3,
+                    contrast=0.4,
+                    saturation=0.5,
+                    hue=0.08,
+                ),
+                VideoToNumpy(apply_to=self.video_keys),
+                StateActionToTensor(apply_to=self.state_keys + self.action_keys),
+                StateActionTransform(
+                    apply_to=self.state_keys,
+                    normalization_modes={key: "q99" for key in self.state_keys},
+                ),
+                StateActionTransform(
+                    apply_to=self.action_keys,
+                    normalization_modes={key: "q99" for key in self.action_keys},
+                ),
+            ]
+        )
+
+
 ROBOT_TYPE_CONFIG_MAP = {
     "unitree_g1_inspire_piston": PistonG1InspirePI05DataConfig(),
     "unitree_g1_inspire_piston_fullstate": PistonG1InspirePI05FullStateDataConfig(),
@@ -278,6 +366,8 @@ ROBOT_TYPE_CONFIG_MAP = {
     "unitree_g1_piston": PistonPickPlaceG1OFTDataConfig(),
     # GR00T-N1.7 recipe (Cosmos-Reason2 backbone + flow-matching DiT head).
     "unitree_g1_piston_n1d7": PistonPickPlaceG1GR00TN1d7DataConfig(),
+    # Same, plus the two wrist views (3 camera streams into the VLM backbone).
+    "unitree_g1_piston_wristcam_n1d7": PistonWristCamG1GR00TN1d7DataConfig(),
 }
 
 
@@ -303,5 +393,30 @@ DATASET_NAMED_MIXTURES = {
     # GR00T-N1.7 recipe mixture (same dataset; consumed with include_state:true).
     "unitree_g1_piston_pnp_n1d7": [
         ("g1-inspire-piston-pick-place", 1.0, "unitree_g1_piston_n1d7"),
+    ],
+    # LONG-HORIZON piston task, GR00T-N1.7 recipe.
+    #   HF: hf download birbirll/g1-inspire-piston-longhorizon --repo-type dataset \
+    #         --local-dir <DATA_ROOT>/g1-inspire-piston-longhorizon
+    # 67 episodes / 45,938 frames @ 50 fps, ego_view 240x424 — the SAME modality
+    # layout as g1-inspire-piston-pick-place (29-dim state, 30-dim action, same
+    # group order), so it reuses the `unitree_g1_piston_n1d7` DataConfig unchanged.
+    # What differs is the TASK: a 3-stage instruction ("pick up the piston with the
+    # right hand, inject it into the tube held by the left hand, then move it over
+    # the hole plate") with ~687-frame (13.7 s) episodes vs ~266 (5.3 s) before.
+    "unitree_g1_piston_longhorizon_n1d7": [
+        ("g1-inspire-piston-longhorizon", 1.0, "unitree_g1_piston_n1d7"),
+    ],
+    # THREE-camera long-horizon (ego + both wrists) — see
+    # PistonWristCamG1GR00TN1d7DataConfig for the view-order contract.
+    #   HF: hf download birbirll/g1-inspire-piston-longhorizon-v3-wristcam \
+    #         --repo-type dataset \
+    #         --local-dir <DATA_ROOT>/g1-inspire-piston-longhorizon-v3-wristcam
+    # DEPLOY COUPLING: a policy trained on this mixture REQUIRES all three
+    # streams at eval. The Isaac piston env currently has its wrist cameras
+    # commented out (they were disabled because rendering three views dropped
+    # the sim to ~9% real-time), so they must be re-enabled before this
+    # checkpoint can be served.
+    "unitree_g1_piston_wristcam_n1d7": [
+        ("g1-inspire-piston-longhorizon-v3-wristcam", 1.0, "unitree_g1_piston_wristcam_n1d7"),
     ],
 }

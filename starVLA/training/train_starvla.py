@@ -57,8 +57,50 @@ from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_par
 deepspeed_plugin = (
     DeepSpeedPlugin() if os.environ.get("ACCELERATE_USE_DEEPSPEED", "false") == "true" else None
 )
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
+# DDP and PARAMETERS THAT NEVER SEE THE LOSS. Frameworks that consume a
+# backbone's hidden states rather than its output head carry modules that get
+# no gradient — CosmosGR00TN1d7 truncates the Cosmos LLM to select_layer and
+# reads hidden_states, leaving lm_head (and friends) unused. DDP then waits
+# forever for a reduction that never comes and fails the NEXT iteration with
+# "Expected to have finished reduction in the prior iteration before starting a
+# new one" (8xB200, 2026-08-06). find_unused_parameters=True makes DDP discover
+# them each step; it costs a traversal per iteration, so it is OPT-IN via
+# DDP_FIND_UNUSED_PARAMETERS=true rather than always on. Env-gated because the
+# Accelerator is built at import time, before any config is parsed.
+_ddp_kwargs = []
+if os.environ.get("DDP_FIND_UNUSED_PARAMETERS", "false").lower() in ("1", "true", "yes"):
+    from accelerate import DistributedDataParallelKwargs
+
+    _ddp_kwargs.append(DistributedDataParallelKwargs(find_unused_parameters=True))
+accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin, kwargs_handlers=_ddp_kwargs or None)
 accelerator.print(accelerator.state)
+
+
+def barrier():
+    """``dist.barrier()`` BOUND TO THIS RANK'S DEVICE.
+
+    A bare ``dist.barrier()`` gives ProcessGroupNCCL no device, so it guesses
+    one and says so:
+
+        Guessing device ID based on global rank. This can cause a hang if
+        rank to GPU mapping is heterogeneous. You can specify device_id in
+        init_process_group()
+
+    That is not a cosmetic warning — it is the documented hang, and it is what
+    an 8xB200 run hit (2026-08-06): all eight ranks spinning at 100% CPU in
+    cudaStreamSynchronize with the NCCL mesh fully connected (64 established
+    sockets), no GPU work, and the run never reaching prepare_training().
+    Passing ``device_ids`` removes the guess.
+
+    Guarded for the single-process and gloo cases, where ``device_ids`` is
+    either meaningless or rejected.
+    """
+    if not dist.is_initialized():
+        return
+    if dist.get_backend() == "nccl" and torch.cuda.is_available():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier()
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -90,7 +132,7 @@ def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
 
     accelerator.dataloader_config.dispatch_batches = False
     if dist.is_initialized():
-        dist.barrier()
+        barrier()
     return vla_train_dataloader
 
 
@@ -420,7 +462,7 @@ class VLATrainer(TrainerUtils):
 
         del examples
         if dist.is_initialized():
-            dist.barrier()
+            barrier()
         return step_metrics
 
     def _log_training_config(self):
@@ -511,7 +553,7 @@ def main(cfg) -> None:
 
     logger.info("... and that's all, folks!")
     if dist.is_initialized():
-        dist.barrier()
+        barrier()
         dist.destroy_process_group()
 
 

@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field, ValidationError
 from torch.utils.data import Dataset
 from tqdm import tqdm
 from PIL import Image
+import torch
 import torch.distributed as dist
 
 from starVLA.dataloader.gr00t_lerobot.video import get_all_frames, get_frames_by_timestamps
@@ -554,6 +555,23 @@ def calculate_rel_action_statistics(
         }
     return rel_stats
 
+
+def _barrier():
+    """``dist.barrier()`` bound to this rank's device.
+
+    A bare barrier leaves ProcessGroupNCCL to GUESS the device from the global
+    rank, which PyTorch warns "can cause a hang" — and did, on an 8xB200 run
+    (2026-08-06). Mirrors train_starvla.barrier(); kept local so the dataloader
+    does not import the trainer.
+    """
+    if not dist.is_initialized():
+        return
+    if dist.get_backend() == "nccl" and torch.cuda.is_available():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier()
+
+
 class ModalityConfig(BaseModel):
     """Configuration for a modality."""
 
@@ -854,7 +872,7 @@ class LeRobotSingleDataset(Dataset):
             le_statistics = None
 
         if dist.is_initialized():
-            dist.barrier()
+            _barrier()
 
         if le_statistics is None:
             le_statistics = _load_stats_cache(
@@ -985,20 +1003,30 @@ class LeRobotSingleDataset(Dataset):
         steps_path = self.dataset_path / "meta" / steps_filename
     
         # ---------- try to read from cache  ----------
+        # NO EARLY RETURN HERE, and that is the whole point. This used to
+        # `return` on a cache hit, which skipped the barrier below — and
+        # whether a rank hits the cache is a RACE, because rank 0 CREATES the
+        # file a second or two into this very call. On a fresh dataset the
+        # slow ranks found no file and entered the barrier while the ranks
+        # that checked after rank 0's os.replace() returned early and never
+        # did: a barrier needs every rank, so the run deadlocked here with no
+        # error (observed 2026-08-06, 8xB200, 4 of 8 ranks reporting in).
+        # Every rank now reaches the same single barrier on every path.
+        cached_data = None
         if steps_path.exists():
             try:
                 with open(steps_path, "rb") as f:
                     cached_data = pickle.load(f)
-                return cached_data["steps"]
             except Exception as e:
                 # include EOFError / PickleError / KeyError
                 print(
                     f"[RANK {os.environ.get('RANK', 'NA')}] "
                     f"Failed to load cached steps ({e}), will rebuild."
                 )
-    
+                cached_data = None
+
         # ---------- only build by rank0  ----------
-        if is_main():
+        if is_main() and cached_data is None:
             all_steps = self._get_all_steps_single_process()
     
             cache_data = {
@@ -1020,13 +1048,20 @@ class LeRobotSingleDataset(Dataset):
             print(f"[RANK 0] Cached steps saved to {steps_path}")
     
         # ---------- sync after rank0  ----------
+        # UNCONDITIONAL: reached exactly once by every rank, cache hit or miss.
+        # Making this conditional on the cache state is what deadlocked the run
+        # (see the note above) — the condition differs per rank by construction.
         if dist.is_initialized():
-            dist.barrier()
-    
+            _barrier()
+
         # ---------- read by all rank ----------
-        with open(steps_path, "rb") as f:
-            cached_data = pickle.load(f)
-    
+        # A rank that missed the cache reads it now; the barrier guarantees
+        # rank 0's atomic os.replace() has landed. A rank that already loaded
+        # it keeps what it has rather than re-reading the same bytes.
+        if cached_data is None:
+            with open(steps_path, "rb") as f:
+                cached_data = pickle.load(f)
+
         return cached_data["steps"]
 
     def _get_steps_config_key(self) -> str:

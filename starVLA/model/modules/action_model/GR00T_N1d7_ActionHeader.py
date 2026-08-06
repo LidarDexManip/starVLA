@@ -185,6 +185,11 @@ class GR00TN1d7ActionHead(nn.Module):
         pred = self.action_decoder(model_output, embodiment_id)
         pred_actions = pred[:, -actions.shape[1]:]
 
+        # NOTE: ``action_mask`` is a WEIGHT, not just a {0,1} validity flag — the
+        # framework may scale flagged rows (e.g. CosmosGR00T_N1d7._frame_weights
+        # up-weights press-phase frames). Normalising by ``action_mask.sum()``
+        # therefore yields a weighted mean, which keeps the loss on the same scale
+        # whatever the weights are. Do not replace it with a plain ``.mean()``.
         per_elem = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = per_elem.sum() / (action_mask.sum() + 1e-6)
         return loss

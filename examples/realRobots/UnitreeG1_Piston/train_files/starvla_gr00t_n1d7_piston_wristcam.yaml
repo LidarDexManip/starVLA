@@ -1,4 +1,15 @@
-# GR00T-N1.7 fine-tune for G1 + Inspire piston pick-and-place.
+# GR00T-N1.7 fine-tune for the LONG-HORIZON G1 + Inspire piston task, with
+# THREE camera streams (ego + left wrist + right wrist) into the VLM backbone.
+#
+# Differences from starvla_gr00t_n1d7_piston.yaml:
+#   - data_mix           unitree_g1_piston_wristcam_n1d7  (3 video keys)
+#   - expected_num_views 3      (serve-time camera-count contract)
+#   - grasp_loss_weight  3.0    (press-phase weighting; valid here because this
+#                                dataset's action dim 25 spans q01=-0.10..q99=0.25)
+#   - per_device_batch_size 4 / accum 8   (3 views ~= 3x the image tokens)
+# Training starts from the OFFICIAL nvidia/GR00T-N1.7-3B weights, not from a
+# previous starVLA run: pass PRETRAINED_N1D7 (or let it auto-find the HF cache)
+# and leave PRETRAINED_CHECKPOINT empty.
 #
 # Framework CosmosGR00TN1d7 = a starVLA-native reproduction of NVIDIA
 # GR00T-N1.7 that DIRECTLY LOADS the public nvidia/GR00T-N1.7-3B parameters:
@@ -12,7 +23,7 @@
 # Unlike QwenOFT, this policy is flow-matching and CONDITIONS ON STATE, so
 # include_state is TRUE here.
 
-run_id: starvla_gr00t_n1d7_piston_g1
+run_id: starvla_gr00t_n1d7_piston_wristcam
 run_root_dir: outputs/starvla
 seed: 42
 wandb_entity: your_wandb_entity
@@ -72,12 +83,12 @@ framework:
     # get `grasp_loss_weight` on all action dims; the head's mask-normalised loss
     # turns that into the weighted mean  L = Sum(w*err) / Sum(w).
     #
-    # 1.0 DISABLES it, which is correct for `unitree_g1_piston_pnp_n1d7`: in that
-    # dataset dim 25 is CONSTANT at -0.1 (q01 == q99), so StateActionTransform
-    # passes it through un-normalised and the threshold would flag 100% of frames.
-    # Set to 3.0 only for `unitree_g1_piston_longhorizon_n1d7`, where dim 25 spans
-    # q01=-0.10 .. q99=0.25 and the threshold flags ~21% of frames.
-    grasp_loss_weight: 1.0
+    # Verified against this dataset's meta/stats.json: q01=-0.10, q99=+0.25, so
+    # the -0.143 threshold is exactly raw > 0.05 and flags ~21% of frames. Do NOT
+    # copy this value onto `unitree_g1_piston_pnp_n1d7`, where dim 25 is constant
+    # (q01 == q99, StateActionTransform passes it through un-normalised) and the
+    # threshold would flag 100% of frames -- a silent no-op.
+    grasp_loss_weight: 3.0
     grasp_weight_dim: 25
     # normalised: 2*(0.05 - q01)/(q99 - q01) - 1 with q01=-0.10, q99=0.25 -> -0.1429
     # i.e. raw thumb > 0.05, lifted from its -0.1 rest.
@@ -105,15 +116,26 @@ datasets:
     dataset_py: lerobot_datasets
     # TRUE on purpose: N1.7 is a flow-matching policy that conditions on proprio.
     include_state: true
-    data_root_dir: /home/jren313/Datasets/pickplace_hf
-    data_mix: unitree_g1_piston_pnp_n1d7
+    data_root_dir: /home/jren313/Datasets
+    data_mix: unitree_g1_piston_wristcam_n1d7
+    # Serve-time camera-count contract == len(video_keys) of the DataConfig above
+    # (ego_view, left_wrist_view, right_wrist_view, IN THAT ORDER). The framework
+    # logs a loud error if an eval client sends a different count; without it the
+    # mismatch is silent. See CosmosGR00T_N1d7._check_num_views.
+    expected_num_views: 3
     lerobot_version: v2.0             # v2.1 layout reads fine via the v2.0 path
     action_type: abs_qpos
     action_mode: abs
     sequential_step_sampling: false
-    per_device_batch_size: 8          # micro-batch; eff. batch = 8 * accum(4) = 32
+    # 3 views ~= 192 image tokens/sample vs 64, so halve the micro-batch and
+    # double accum to keep the effective batch at 32.
+    per_device_batch_size: 4
     load_all_data_for_training: true
-    obs_image_size: [256, 256]        # N1.7 image_target_size
+    # Cosmetic only: LeRobotSingleDataset._pack_sample resizes every view to
+    # 224x224, and the Cosmos processor's shortest_edge (65536 px) floor lifts
+    # both 224 and 256 to the same 16x16 patch grid (64 tokens/view). Kept at the
+    # N1.7 image_target_size so train and serve stay on the same code path.
+    obs_image_size: [256, 256]
     delete_pause_frame: false
     video_backend: decord
     num_workers: 4
@@ -141,7 +163,7 @@ trainer:
   gradient_clipping: 1.0
   # Informational only — real accum comes from ACCELERATE_GRADIENT_ACCUMULATION_STEPS
   # exported by the launcher (Accelerator is built at import time). Keep in sync.
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 8
   gradient_checkpointing: true
 
   optimizer:
