@@ -398,6 +398,78 @@ class PolicyNormProcessor:
         return self._transform
 
     # ------------------------------------------------------------------
+    # Forward path (env proprioception → model input)
+    # ------------------------------------------------------------------
+    def apply_state(self, raw_state: np.ndarray) -> np.ndarray:
+        """Normalize proprioception with the TRAINING pipeline.
+
+        The module docstring has promised this method since the class was
+        written, but it did not exist — so every client that switched state on
+        sent RAW joint angles to a checkpoint trained on q99-normalised ones.
+        That is why the pipette lane serves ``--no_state``: not because state
+        was useless, but because the only available spelling of it was wrong.
+
+        Args:
+            raw_state: ``(T, D)`` or ``(D,)`` in ENV units (radians, registers),
+                laid out as ``state_keys`` concatenated in DataConfig order.
+                ``T`` is the state history depth; every frame is normalised
+                with the same per-key statistics, exactly as the dataloader
+                does when ``state_indices`` has more than one entry.
+
+        Returns:
+            The same shape, normalised — ready to hand to the action head.
+
+        Only the state-side transforms run. Video transforms are skipped
+        (there are no video keys in ``data``), and the state ones document
+        that they "allow some keys to be missing", so restricting the dict to
+        state keys is the pipeline's own supported behaviour rather than a
+        parallel implementation of the normalisation math.
+        """
+        from starVLA.dataloader.gr00t_lerobot.transform.state_action import (
+            StateActionToTensor,
+            StateActionTransform,
+        )
+
+        arr = np.asarray(raw_state, dtype=np.float32)
+        squeeze = arr.ndim == 1
+        if squeeze:
+            arr = arr[None, :]
+        if arr.ndim != 2:
+            raise ValueError(f"Expected (T, D) or (D,); got shape {arr.shape}")
+
+        sum_dims = sum(self._state_key_dims.get(k, 1) for k in self._state_keys)
+        if arr.shape[-1] != sum_dims:
+            raise ValueError(
+                f"state has {arr.shape[-1]} dims but the DataConfig's state "
+                f"keys require {sum_dims}. state_keys={self._state_keys}, "
+                f"state_key_dims={self._state_key_dims}"
+            )
+
+        data: Dict[str, Any] = {}
+        cursor = 0
+        for full_key in self._state_keys:
+            dim_k = self._state_key_dims.get(full_key, 1)
+            data[full_key] = arr[:, cursor : cursor + dim_k]
+            cursor += dim_k
+
+        state_side = set(self._state_keys)
+        for transform in self._transform.transforms:
+            if not isinstance(transform, (StateActionToTensor, StateActionTransform)):
+                continue
+            if not state_side.intersection(getattr(transform, "apply_to", [])):
+                continue
+            data = transform(data)
+
+        parts: List[np.ndarray] = []
+        for full_key in self._state_keys:
+            v = data[full_key]
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu().numpy()
+            parts.append(np.asarray(v, dtype=np.float32))
+        out = np.concatenate(parts, axis=-1)
+        return out[0] if squeeze else out
+
+    # ------------------------------------------------------------------
     # Inverse path (model output → env action)
     # ------------------------------------------------------------------
     def unapply_actions(self, normalized_actions: np.ndarray) -> np.ndarray:

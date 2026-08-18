@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
 from typing import Any, Callable, ClassVar, Literal
 
 import albumentations as A
@@ -461,6 +462,65 @@ class VideoColorJitter(VideoTransform):
             )
         else:
             raise ValueError(f"Backend {self.backend} not supported")
+
+
+class _ColourTemperatureShift:
+    """Per-channel gain: R up / B down is warmer, the reverse is cooler."""
+
+    def __init__(self, strength: float):
+        self.strength = float(strength)
+
+    def __call__(self, video: torch.Tensor) -> torch.Tensor:
+        t = random.uniform(-self.strength, self.strength)
+        gains = torch.tensor([1.0 + t, 1.0, 1.0 - t],
+                             dtype=video.dtype, device=video.device)
+        # C is at dim -3 for both (T,C,H,W) and (T,B,C,H,W).
+        out = video * gains.view(-1, 1, 1)
+        # Preserve mean intensity so this varies COLOUR ONLY. Exposure is
+        # VideoColorJitter's brightness axis; letting both move the same
+        # quantity would double-count it and make neither calibratable.
+        scale = video.mean() / out.mean().clamp(min=1e-6)
+        return (out * scale).clamp(0.0, 1.0)
+
+
+class VideoColorTemperature(VideoTransform):
+    """White-balance jitter: the augmentation this bench actually needs.
+
+    VideoColorJitter's `hue` rotates the HSV wheel uniformly. A camera's
+    white balance does something physically different -- it applies
+    per-channel GAIN -- and white balance is what moved on this bench:
+    measured 2026-08-13, the scene's median hue was 68 in the training
+    data, 93 on the same bench hours later under changed room lighting,
+    and 13 once white balance was pinned to 5800K. Rotating hue to cover
+    that also rotates the RED TIP, which is the one colour the task is
+    defined by ("attach a red pipette tip"); a channel gain warms or cools
+    the tip while leaving it red.
+
+    ``strength`` is the maximum fractional gain: R *= 1+t, B *= 1-t with
+    t ~ U(-strength, +strength). Calibrate it against the scene hue the
+    deployment actually produces rather than by eye -- see
+    tools/calibrate_wb_aug.py.
+
+    SHARE THIS ACROSS VIEWS, exactly like VideoColorJitter: the ego frame
+    and its own crop are the same photons through the same sensor, so a
+    per-view draw would teach the model the two views disagree about the
+    colour of the scene.
+    """
+
+    strength: float = Field(
+        ..., description="Max fractional per-channel gain (0 disables)"
+    )
+
+    def get_transform(self, mode: Literal["train", "eval"] = "train") -> Callable | None:
+        """Train-mode only, like every other augmentation here: eval must
+        see the sensor's own colours."""
+        if mode == "eval" or self.strength <= 0:
+            return None
+        if self.backend != "torchvision":
+            raise ValueError(
+                f"VideoColorTemperature supports torchvision only, got {self.backend}"
+            )
+        return _ColourTemperatureShift(self.strength)
 
 
 class VideoRandomGrayscale(VideoTransform):

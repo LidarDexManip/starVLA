@@ -26,6 +26,7 @@ matches the G1 piston robot), and mask the loss to the real action dims.
 """
 
 import glob
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +44,33 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import merge_framework_config
 from starVLA.model.modules.action_model.GR00T_N1d7_ActionHeader import get_action_model_n1d7
 from starVLA.model.modules.vlm import get_vlm_model
+
+
+def _infer_head_dtype():
+    """Compute dtype for the action head AT INFERENCE ONLY.
+
+    The head is wrapped in autocast(float32) in BOTH the training forward
+    and predict_action, so fp32 is the trained numerics and stays the
+    default -- serving in bf16 is a train/deploy precision change and must
+    be asked for, not inherited from --use_bf16 (which casts weights but
+    says nothing about compute).
+
+    STARVLA_BF16_ACTION_HEAD=1 switches it. Why anyone would: the head is
+    32 DiT layers x 4 sequential denoising steps and it is HALF the
+    server's time (~52 ms of ~102 measured 2026-08-13 on an RTX 4080),
+    running fp32 with no tensor cores while the weights are already bf16.
+    Measured on 12 real observations with the sampler seeded identically
+    per call, bf16 vs fp32:
+        action MAE 0.0021, max 0.032 (normalised units)
+    against a SAMPLING NOISE FLOOR of ~0.020 MAE -- the head starts from
+    torch.randn, so two fp32 runs of the same input differ by 10x more
+    than fp32-vs-bf16 does. End-to-end that was 95 ms -> 56 ms.
+    Read per call, not at import: a server may be restarted into a
+    different setting without reloading this module.
+    """
+    if os.environ.get("STARVLA_BF16_ACTION_HEAD", "") not in ("", "0"):
+        return torch.bfloat16
+    return torch.float32
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils import initialize_overwatch
 from starVLA.training.trainer_utils.trainer_tools import resize_images
@@ -258,6 +286,59 @@ class CosmosGR00T_N1d7(baseframework):
                     return str(p)
         return None
 
+    # ------------------------------------------------------- state history
+    def _widen_state_encoder(self, remapped: dict) -> dict:
+        """Warm-start a state_history_length > 1 head from the T=1 checkpoint.
+
+        The head embeds state by FLATTENING history into the projector:
+        ``state[B, T, D] -> [B, 1, T*D]`` through a CategorySpecificLinear whose
+        ``W`` is ``[num_categories, T*D, hidden]``. So T is baked into a weight
+        SHAPE — nvidia/GR00T-N1.7-3B ships T=1 (W is [32, 132, 1024]) and any
+        T>1 head cannot load it 1:1. ``load_state_dict(strict=False)`` does not
+        rescue this: strict=False forgives MISSING keys, not shape mismatches,
+        which still raise.
+
+        Rather than drop the pretrained projector and start that layer from
+        noise, place it on the MOST RECENT timestep's column block and zero the
+        older ones. ``_prep_state`` right-aligns history, so the newest frame is
+        the last row and — because the reshape is row-major — occupies the LAST
+        D columns of the flattened vector. At initialisation the widened layer
+        therefore computes exactly what the T=1 layer computed, and training
+        only has to learn what the extra history is worth. Starting it from
+        noise instead would throw away the pretrained state embedding for every
+        embodiment at once.
+
+        No-op when T == 1, so every existing lane loads byte-identically.
+        """
+        T = self.state_history_length
+        if T <= 1:
+            return remapped
+        own = self.state_dict()
+        out = dict(remapped)
+        for key, ckpt_w in remapped.items():
+            if not key.endswith("state_encoder.layer1.W"):
+                continue
+            want = own.get(key)
+            if want is None or want.shape == ckpt_w.shape:
+                continue
+            if (want.shape[0], want.shape[2]) != (ckpt_w.shape[0], ckpt_w.shape[2]) \
+                    or want.shape[1] != ckpt_w.shape[1] * T:
+                logger.warning(
+                    f"[N1.7 load] {key}: cannot widen {tuple(ckpt_w.shape)} -> "
+                    f"{tuple(want.shape)} for state_history_length={T}; "
+                    "leaving it randomly initialised")
+                out.pop(key)
+                continue
+            d = ckpt_w.shape[1]
+            wide = torch.zeros_like(want)
+            wide[:, (T - 1) * d:, :] = ckpt_w.to(wide.dtype)
+            out[key] = wide
+            logger.info(
+                f"[N1.7 load] {key}: widened {tuple(ckpt_w.shape)} -> "
+                f"{tuple(want.shape)} for state_history_length={T} "
+                "(pretrained block on the newest frame, older frames zeroed)")
+        return out
+
     # -------------------------------------------------------------- weight load
     def _load_n1d7_pretrained(self, ckpt_dir: str) -> None:
         from safetensors.torch import load_file
@@ -273,6 +354,8 @@ class CosmosGR00T_N1d7(baseframework):
             elif k.startswith("action_head."):
                 remapped[k] = v  # self.action_head.* aligns directly
             # (anything else is ignored on purpose)
+
+        remapped = self._widen_state_encoder(remapped)
 
         model_keys = set(self.state_dict().keys())
         ckpt_keys = set(remapped.keys())
@@ -462,9 +545,10 @@ class CosmosGR00T_N1d7(baseframework):
         vl_embeds, image_mask, attn_mask = self._encode_vl(images, instructions)
         device = vl_embeds.device
 
-        with torch.autocast("cuda", dtype=torch.float32):
-            vl_embeds = vl_embeds.float()
-            st = self._prep_state(state, len(examples), device, torch.float32)
+        head_dtype = _infer_head_dtype()
+        with torch.autocast("cuda", dtype=head_dtype):
+            vl_embeds = vl_embeds.to(head_dtype)
+            st = self._prep_state(state, len(examples), device, head_dtype)
             emb = self._embodiment_ids(len(examples), device)
             pred = self.action_head.predict_action(
                 vl_embeds=vl_embeds,

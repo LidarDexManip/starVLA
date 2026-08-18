@@ -100,6 +100,13 @@ ACTION_DIM = sum(ACTION_DIMS.values())  # 35
 CHUNK = 30
 
 
+#: What the stub's apply_state multiplies by. Any recognisable factor works;
+#: the point is that the test can tell normalised state from raw, because
+#: sending RAW state to a head trained on q99-normalised state was a real bug
+#: (it is why the pipette lane shipped --no_state).
+STATE_NORM_SCALE = 0.01
+
+
 class _StubProcessor:
     unnorm_key = "unitree_g1_wbc"
     state_keys = STATE_KEYS
@@ -107,13 +114,25 @@ class _StubProcessor:
     action_keys = ACTION_KEYS
     action_key_dims = ACTION_DIMS
 
+    def apply_state(self, raw_state):
+        """Stand-in for the training-time state normalisation.
+
+        Shape-preserving and per-frame, exactly like the real
+        PolicyNormProcessor.apply_state: a normaliser that mixed frames
+        together would manufacture a velocity the robot never had.
+        """
+        return np.asarray(raw_state, dtype=np.float32) * STATE_NORM_SCALE
+
 
 class _StubWrapper:
     """Duck-typed PolicyServerWrapper: records requests, returns a chunk whose
     flat dim d holds the constant value d (so the split is verifiable)."""
 
-    def __init__(self):
+    def __init__(self, state_history_length: int = 1):
         self.requests = []
+        # The real wrapper publishes this in the handshake; the adapter sizes
+        # its history slice from it.
+        self.metadata = {"state_history_length": state_history_length}
 
     def get_norm_processor(self, unnorm_key=None):
         return _StubProcessor()
@@ -209,13 +228,49 @@ class Gr00tZmqCompatServerTest(unittest.TestCase):
         example = self.wrapper.requests[-1]["examples"][0]
         expected_state = np.concatenate(
             [np.full(STATE_DIMS[k], 100.0 + i, dtype=np.float32) for i, k in enumerate(STATE_KEYS)]
-        )
-        np.testing.assert_array_equal(example["state"][0], expected_state)
+        ) * STATE_NORM_SCALE
+        np.testing.assert_allclose(example["state"][0], expected_state, rtol=0, atol=1e-6)
         self.assertEqual(example["state"].shape, (1, expected_state.size))
         self.assertEqual(example["lang"], "pick up the apple")
         self.assertEqual(len(example["image"]), 1)
         self.assertEqual(example["image"][0].shape, (224, 224, 3))
         self.assertEqual(example["image"][0][0, 0, 0], 42)
+
+    def test_state_history_depth_comes_from_the_checkpoint(self):
+        """A head built with state_history_length > 1 must receive that many
+        frames, oldest first — not the newest one repeated, and not the newest
+        one alone. The depth is a checkpoint FACT (the head's state_encoder
+        input is max_state_dim * state_history_length), so the adapter takes it
+        from the wrapper's handshake rather than from the client's array."""
+        wrapper = _StubWrapper(state_history_length=3)
+        policy = Gr00tCompatPolicy(wrapper, send_state=True)
+
+        example = policy.obs_to_example(_bridge_observation(n_hist=4))
+        flat_dim = sum(STATE_DIMS.values())
+        self.assertEqual(example["state"].shape, (3, flat_dim))
+        # _bridge_observation fills history with -1 and only the LATEST frame
+        # with the group markers, so the newest row must differ from the rest.
+        newest = np.concatenate(
+            [np.full(STATE_DIMS[k], 100.0 + i, dtype=np.float32)
+             for i, k in enumerate(STATE_KEYS)]) * STATE_NORM_SCALE
+        np.testing.assert_allclose(example["state"][-1], newest, rtol=0, atol=1e-6)
+        np.testing.assert_allclose(
+            example["state"][0],
+            np.full(flat_dim, -1.0, dtype=np.float32) * STATE_NORM_SCALE,
+            rtol=0, atol=1e-6)
+
+    def test_short_client_history_is_padded_with_its_oldest_frame(self):
+        """Right after a reset the bridge's ring buffer is not full. Padding
+        with the oldest AVAILABLE frame keeps the implied velocity at zero;
+        zero-padding would imply a violent lunge from the origin on the first
+        ticks after every reset."""
+        wrapper = _StubWrapper(state_history_length=4)
+        policy = Gr00tCompatPolicy(wrapper, send_state=True)
+
+        example = policy.obs_to_example(_bridge_observation(n_hist=1))
+        self.assertEqual(example["state"].shape, (4, sum(STATE_DIMS.values())))
+        for row in range(1, 4):
+            np.testing.assert_array_equal(example["state"][0], example["state"][row])
 
     def test_missing_state_key_is_reported_not_fatal(self):
         obs = _bridge_observation()

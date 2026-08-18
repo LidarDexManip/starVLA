@@ -87,6 +87,15 @@ class PolicyServerWrapper:
             raise ValueError(
                 f"PolicyServerWrapper: no action_horizon or future_action_window_size found in model config for {self._ckpt_path}"
             )
+        # State history depth the action head was BUILT with. The head's
+        # state_encoder input is max_state_dim * state_history_length, so this
+        # is a checkpoint fact, not a preference: send fewer frames and the
+        # oldest slots are zero-padded (a state the robot was never in), send
+        # more and they are silently dropped. Published in the handshake so a
+        # client can size its own ring buffer from the checkpoint.
+        self._state_history_length = int(
+            action_model_cfg.get("state_history_length", 1))
+
         # Cache of PolicyNormProcessor instances per unnorm_key.
         # For single-dataset ckpts unnorm_key is auto-selected; for multi-dataset
         # ckpts clients must pass unnorm_key per request.
@@ -148,6 +157,7 @@ class PolicyServerWrapper:
             "default_unnorm_key": self._default_unnorm_key,
             "training_data_mix": self._model_cfg.get("datasets", {}).get("vla_data", {}).get("data_mix"),
             "training_obs_image_size": _training_obs_image_size(self._model_cfg),
+            "state_history_length": self._state_history_length,
             "eval_image_contract": (
                 "Eval clients must explicitly choose image count and order. "
                 "The server does not infer or reorder camera views from training config."

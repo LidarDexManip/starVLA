@@ -51,6 +51,31 @@ def _latest_frame(value: Any, dim: int, key: str) -> np.ndarray:
     return arr.reshape(-1)[-dim:]
 
 
+def _last_frames(value: Any, dim: int, key: str, depth: int) -> np.ndarray:
+    """The most recent ``depth`` frames of a state entry as ``(depth, dim)``.
+
+    Accepts the same shapes as :func:`_latest_frame` — ``(1, n_hist, dim)`` /
+    ``(n_hist, dim)`` / ``(dim,)``. When the client sends FEWER frames than the
+    checkpoint wants (a bridge that has just started, buffer not yet full) the
+    oldest available frame is repeated. That is repeat-oldest padding, which is
+    what history.py does on the client and what the dataloader does at the
+    start of an episode; zero-padding instead would hand the head a state the
+    robot has never been in, and a velocity feature computed against it is
+    pure fiction on exactly the ticks after a reset.
+    """
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.shape[-1] != dim:
+        raise ValueError(
+            f"state key {key!r}: expected last dim {dim} (from the checkpoint's "
+            f"DataConfig), got shape {tuple(arr.shape)}"
+        )
+    arr = arr.reshape(-1, dim)
+    if len(arr) >= depth:
+        return arr[-depth:]
+    pad = np.repeat(arr[:1], depth - len(arr), axis=0)
+    return np.concatenate([pad, arr], axis=0)
+
+
 def _latest_image(video_value: Any) -> np.ndarray:
     """Pull the most recent (H, W, 3) frame from a video entry of shape
     (1, n_frames, H, W, 3) / (n_frames, H, W, 3) / (H, W, 3)."""
@@ -104,6 +129,10 @@ class Gr00tCompatPolicy:
         self._fallback_instruction = fallback_instruction
 
         proc = wrapper.get_norm_processor(unnorm_key)
+        self._proc = proc
+        # Checkpoint fact, not a knob — see PolicyServerWrapper.
+        self._state_history_length: int = int(
+            getattr(wrapper, "metadata", {}).get("state_history_length", 1))
         self._unnorm_key: str = proc.unnorm_key
         # Full keys keep DataConfig order ("state.left_arm", ...); subkeys are
         # what appears on the wire ("left_arm", ...).
@@ -115,10 +144,12 @@ class Gr00tCompatPolicy:
         self._video_keys: List[str] = list(getattr(proc, "video_keys", []))
 
         logger.info(
-            "Gr00tCompatPolicy ready: unnorm_key=%s video order=%s state order=%s action split=%s",
+            "Gr00tCompatPolicy ready: unnorm_key=%s video order=%s state order=%s "
+            "(history %d, q99-normalised on this side) action split=%s",
             self._unnorm_key,
             [k.split(".", 1)[-1] for k in self._video_keys],
             [(k.split(".", 1)[-1], self._state_key_dims.get(k, 1)) for k in self._state_keys],
+            self._state_history_length,
             [(k.split(".", 1)[-1], self._action_key_dims.get(k, 1)) for k in self._action_keys],
         )
 
@@ -220,9 +251,16 @@ class Gr00tCompatPolicy:
                         f"checkpoint's DataConfig). Received keys: {sorted(state_in)}"
                     )
                 dim = self._state_key_dims.get(full_key, 1)
-                pieces.append(_latest_frame(state_in[subkey], dim, subkey))
-            flat = np.concatenate(pieces, axis=0).astype(np.float32)
-            example["state"] = flat[np.newaxis, :]
+                pieces.append(_last_frames(
+                    state_in[subkey], dim, subkey, self._state_history_length))
+            # (T, sum_dims): keys concatenated in DataConfig order, oldest row
+            # first — the layout the dataloader produces from state_indices and
+            # the one CosmosGR00T_N1d7._prep_state right-aligns into the head.
+            raw = np.concatenate(pieces, axis=1).astype(np.float32)
+            # NORMALISE. The head was trained on q99-normalised state; sending
+            # raw radians here is the bug that made --no_state the only safe
+            # option on the pipette lane.
+            example["state"] = self._proc.apply_state(raw)
         return example
 
     def split_actions(self, actions: np.ndarray) -> Dict[str, np.ndarray]:

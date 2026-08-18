@@ -43,6 +43,15 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 NUM_PROCESSES="${NUM_PROCESSES:-1}"
 
+# `accelerate launch --num_processes N` WITHOUT --multi_gpu silently runs N
+# copies of a single-process job: no DDP, no gradient sync, N unrelated models
+# on one device. It does not error — it looks exactly like a slow run rather
+# than a misconfiguration. State it.
+# NOTE: CUDA_VISIBLE_DEVICES above defaults to "0", so a multi-GPU run must set
+# it too — NUM_PROCESSES=8 with the default mask would put 8 processes on GPU 0.
+MULTI_GPU_ARGS=()
+if [[ "${NUM_PROCESSES}" -gt 1 ]]; then MULTI_GPU_ARGS+=(--multi_gpu); fi
+
 # -- Data / model ------------------------------------------------------------
 CONFIG_YAML="${CONFIG_YAML:-examples/realRobots/UnitreeG1_Pipette/train_files/starvla_gr00t_n1d7_pipette.yaml}"
 DATA_ROOT="${DATA_ROOT:-${HOME}/Datasets}"
@@ -113,6 +122,7 @@ fi
 
 accelerate launch \
   --num_processes "${NUM_PROCESSES}" \
+  "${MULTI_GPU_ARGS[@]}" \
   --mixed_precision no \
   starVLA/training/train_starvla.py \
   --config_yaml "${CONFIG_YAML}" \
@@ -141,4 +151,5 @@ accelerate launch \
   --run_id "${RUN_ID}" \
   --wandb_project "${WANDB_PROJECT}" \
   --wandb_entity "${WANDB_ENTITY}" \
-  "${EXTRA_ARGS[@]}"
+  "${EXTRA_ARGS[@]}" \
+  "$@"

@@ -84,6 +84,10 @@ class QwenOFTDefaultConfig:
             "future_action_window_size": 8,
             # How many past steps included in action chunk (usually 0)
             "past_action_window_size": 0,
+            # Press-phase frame weighting (see `_weighted_l1`). 1.0 == disabled.
+            "grasp_loss_weight": 1.0,
+            "grasp_weight_dim": 25,
+            "grasp_weight_thresh": -0.143,
         }
     )
 
@@ -134,6 +138,48 @@ class Qwenvl_OFT(baseframework):
 
         # L1 loss
         self.l1_loss = nn.L1Loss()
+
+        # Press-phase frame weighting (training only; 1.0 == disabled). See
+        # `_weighted_l1`.
+        _am = self.config.framework.action_model
+        self.grasp_loss_weight = float(_am.get("grasp_loss_weight", 1.0))
+        self.grasp_weight_dim = int(_am.get("grasp_weight_dim", 25))
+        self.grasp_weight_thresh = float(_am.get("grasp_weight_thresh", -0.143))
+        self._grasp_weight_logged = False
+
+    def _weighted_l1(self, pred_actions, actions_target):
+        """Weighted-mean L1: `L = Σ wₜ·|pred−tgt| / Σ wₜ`.
+
+        The plunger press is a SHORT phase (~21% of frames on the long-horizon
+        piston set), so a uniform mean averages it away. A frame is flagged when
+        the right-hand thumb channel (``grasp_weight_dim``, 25 ==
+        ``action.right_hand[5]``) sits above ``grasp_weight_thresh``, i.e. lifted
+        off its rest value; flagged frames get ``grasp_loss_weight`` on ALL of
+        their action dims. Because it is a weighted MEAN it stays on the same
+        scale as ``nn.L1Loss()``, so LR / grad-clip carry over unchanged.
+        """
+        d = self.grasp_weight_dim
+        press = actions_target[:, :, d] > self.grasp_weight_thresh  # [B, H]
+        if not self._grasp_weight_logged:
+            self._grasp_weight_logged = True
+            frac = press.float().mean().item()
+            logger.info(
+                f"[press-frame weighting] dim={d} thresh={self.grasp_weight_thresh} "
+                f"weight={self.grasp_loss_weight} -> {frac * 100:.1f}% of frames "
+                f"flagged in the first batch."
+            )
+            if frac < 0.01 or frac > 0.99:
+                logger.warning(
+                    "[press-frame weighting] the flag fires on ~all or ~no frames, so "
+                    "the weighted mean collapses back to the plain mean (a silent "
+                    f"no-op). Check that action dim {d} actually VARIES in this "
+                    "dataset: when q01 == q99 StateActionTransform passes the raw "
+                    "value through un-normalised, so the threshold is compared "
+                    "against a raw number."
+                )
+        w = (1.0 + (self.grasp_loss_weight - 1.0) * press.to(actions_target.dtype)).unsqueeze(-1)
+        per_elem = (pred_actions - actions_target).abs()  # [B, H, action_dim]
+        return (per_elem * w).sum() / (w.expand_as(per_elem).sum() + 1e-6)
 
     def forward(
         self,
@@ -205,8 +251,11 @@ class Qwenvl_OFT(baseframework):
             )  # [B, T_full, action_dim]
             actions_target = actions[:, -self.action_horizon :, :]  # (B, action_horizon, action_dim)
 
-            # Compute L1 loss
-            action_loss = self.l1_loss(pred_actions, actions_target)
+            # Compute L1 loss (optionally up-weighting the short press phase)
+            if self.grasp_loss_weight != 1.0:
+                action_loss = self._weighted_l1(pred_actions, actions_target)
+            else:
+                action_loss = self.l1_loss(pred_actions, actions_target)
 
         return {"action_loss": action_loss}
 
