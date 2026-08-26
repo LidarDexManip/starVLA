@@ -58,6 +58,28 @@ assert dataloader == [1, 2, 3]
 """,
         )
 
+    def test_train_starvla_single_process_save_avoids_accelerator_unwrap(self):
+        self._run_prepare_data_subprocess(
+            """
+import importlib
+import types
+
+import torch.nn as nn
+
+module = importlib.import_module("starVLA.training.train_starvla")
+trainer = module.VLATrainer.__new__(module.VLATrainer)
+trainer.model = nn.Linear(2, 3)
+trainer.accelerator = types.SimpleNamespace(
+    num_processes=1,
+    get_state_dict=lambda model: (_ for _ in ()).throw(
+        AssertionError("single-process save must not call Accelerator.get_state_dict")
+    ),
+)
+state_dict = trainer._get_state_dict_for_save()
+assert set(state_dict) == {"weight", "bias"}
+""",
+        )
+
     def test_train_starvlm_prepare_data_safe_without_process_group(self):
         self._run_prepare_data_subprocess(
             """

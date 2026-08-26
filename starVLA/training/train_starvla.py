@@ -341,7 +341,7 @@ class VLATrainer(TrainerUtils):
             save_format = getattr(self.config.trainer, "save_format", "pt")
             checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
 
-            state_dict = self.accelerator.get_state_dict(self.model)
+            state_dict = self._get_state_dict_for_save()
             if save_format == "safetensors":
                 from safetensors.torch import save_file
 
@@ -363,6 +363,16 @@ class VLATrainer(TrainerUtils):
                 logger.info("✅ Configuration files saved")
 
         self.accelerator.wait_for_everyone()
+
+    def _get_state_dict_for_save(self):
+        """Return a model state dict without importing DeepSpeed unnecessarily."""
+        if self.accelerator.num_processes == 1:
+            # Accelerator.prepare() leaves the model unwrapped in a
+            # single-process run. Accelerator.get_state_dict() still calls
+            # unwrap_model(), which imports an installed DeepSpeed package and
+            # can fail on driver-only hosts where CUDA_HOME is not defined.
+            return self.model.state_dict()
+        return self.accelerator.get_state_dict(self.model)
 
     def _log_metrics(self, metrics):
         """Record training metrics."""
@@ -418,7 +428,11 @@ class VLATrainer(TrainerUtils):
             step_metrics = self._train_step(batch_vla)
             t_end_model = time.perf_counter()
 
-            if self.accelerator.sync_gradients:
+            # Capture the accumulation boundary once. Milestone side effects
+            # below must run once per optimizer update, not on every microbatch
+            # for which completed_steps still has the same value.
+            did_optimizer_step = self.accelerator.sync_gradients
+            if did_optimizer_step:
                 progress_bar.update(1)
                 self.completed_steps += 1
 
@@ -430,14 +444,27 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
+            # Do not evaluate at step 0 while gradient accumulation is still in
+            # progress. Apart from wasting a full diffusion rollout, that used
+            # to evaluate after every pre-sync microbatch because completed_steps
+            # remains zero until the first optimizer update.
+            if (
+                did_optimizer_step
+                and self.completed_steps > 0
+                and self.completed_steps % self.config.trainer.eval_interval == 0
+            ):
                 step_metrics = self.eval_action_model(step_metrics)
 
             step_metrics["timing/data"] = t_end_data - t_start_data
             step_metrics["timing/model"] = t_end_model - t_start_model
-            self._log_metrics(step_metrics)
+            if did_optimizer_step:
+                self._log_metrics(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+            if (
+                did_optimizer_step
+                and self.completed_steps > 0
+                and self.completed_steps % self.config.trainer.save_interval == 0
+            ):
                 self._save_checkpoint()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
@@ -449,7 +476,16 @@ class VLATrainer(TrainerUtils):
         """Run simple action-eval on current batch and attach score to metrics."""
         examples = self._get_next_batch()
         actions = [example["action"] for example in examples]
-        output_dict = self.accelerator.unwrap_model(self.model).predict_action(
+        # Single-process Accelerator.prepare() leaves the model unwrapped. Avoid
+        # Accelerator.unwrap_model() here: it eagerly imports an installed
+        # DeepSpeed package even when DeepSpeed is disabled, which fails on
+        # driver-only GPU hosts without a CUDA toolkit/CUDA_HOME.
+        eval_model = (
+            self.model
+            if self.accelerator.num_processes == 1
+            else self.accelerator.unwrap_model(self.model)
+        )
+        output_dict = eval_model.predict_action(
             examples=examples, use_ddim=True, num_ddim_steps=20
         )
 
@@ -508,7 +544,7 @@ class VLATrainer(TrainerUtils):
             save_format = getattr(self.config.trainer, "save_format", "pt")
             final_checkpoint = os.path.join(self.config.output_dir, "final_model")
             os.makedirs(final_checkpoint, exist_ok=True)
-            state_dict = self.accelerator.get_state_dict(self.model)
+            state_dict = self._get_state_dict_for_save()
             if save_format == "safetensors":
                 from safetensors.torch import save_file
 
