@@ -139,6 +139,12 @@ class CosmosGR00TN1d7DefaultConfig:
             "noise_beta_beta": 1.0,
             "noise_s": 0.999,
             "state_dropout_prob": 0.2,
+            # Optional half-open range [start, end) of real action dimensions
+            # supervised by flow-matching loss. None supervises every real dim.
+            "loss_action_dim_range": None,
+            # Deployment-only safety contract consumed by Gr00tCompatPolicy.
+            # Named action groups are overwritten with current raw joint state.
+            "hold_action_keys": [],
             # Press-phase frame weighting (see `_frame_weights`). 1.0 == disabled.
             "grasp_loss_weight": 1.0,
             "grasp_weight_dim": 25,
@@ -190,6 +196,33 @@ class CosmosGR00T_N1d7(baseframework):
         self.max_state_dim = int(am.max_state_dim)
         self.state_history_length = int(am.get("state_history_length", 1))
         self.embodiment_id_value = int(self.config.framework.get("embodiment_id", 25))
+
+        # Per-dimension action supervision. The GR00T action head is shared, so
+        # there is no independent "left-arm module" to freeze. Masking its loss
+        # dimensions is the precise way to prevent left-side target errors from
+        # contributing gradients while preserving the official 54-D interface.
+        loss_dim_range = am.get("loss_action_dim_range", None)
+        if loss_dim_range is None:
+            self.loss_action_dim_range = (0, self.action_dim)
+        else:
+            loss_dim_range = list(loss_dim_range)
+            if len(loss_dim_range) != 2:
+                raise ValueError(
+                    "framework.action_model.loss_action_dim_range must be "
+                    f"[start, end], got {loss_dim_range!r}"
+                )
+            self.loss_action_dim_range = tuple(int(v) for v in loss_dim_range)
+        start, end = self.loss_action_dim_range
+        if not (0 <= start < end <= self.action_dim):
+            raise ValueError(
+                "framework.action_model.loss_action_dim_range must satisfy "
+                f"0 <= start < end <= action_dim ({self.action_dim}), got {(start, end)}"
+            )
+        if self.loss_action_dim_range != (0, self.action_dim):
+            logger.info(
+                f"[action supervision] loss is restricted to real action dims "
+                f"[{start}, {end}); other action dims have zero loss weight."
+            )
 
         # press-phase frame weighting (training only; see `_frame_weights`)
         self.grasp_loss_weight = float(am.get("grasp_loss_weight", 1.0))
@@ -410,7 +443,19 @@ class CosmosGR00T_N1d7(baseframework):
             mask[i, H - t:, :d] = 1.0
         if self.grasp_loss_weight != 1.0:
             mask = mask * self._frame_weights(actions, mask)
+        mask = self._apply_loss_action_dim_range(mask)
         return actions, mask
+
+    def _apply_loss_action_dim_range(self, mask):
+        """Zero loss weights outside the configured real-action dimension range."""
+        start, end = self.loss_action_dim_range
+        if start == 0 and end == self.action_dim:
+            return mask
+        dim_mask = torch.zeros(
+            (self.max_action_dim,), device=mask.device, dtype=mask.dtype
+        )
+        dim_mask[start:end] = 1
+        return mask * dim_mask.view(1, 1, -1)
 
     def _frame_weights(self, actions, mask):
         """[B,H,132] -> [B,H,1] per-frame loss weight, folded into ``action_mask``.

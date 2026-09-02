@@ -140,8 +140,30 @@ class Gr00tCompatPolicy:
         self._state_key_dims: Dict[str, int] = dict(proc.state_key_dims)
         self._action_keys: List[str] = list(proc.action_keys)
         self._action_key_dims: Dict[str, int] = dict(proc.action_key_dims)
+        self._hold_action_keys: List[str] = [
+            str(key).split(".", 1)[-1]
+            for key in getattr(wrapper, "metadata", {}).get("hold_action_keys", [])
+        ]
         # Camera views in TRAINING order; see `_resolve_video_order`.
         self._video_keys: List[str] = list(getattr(proc, "video_keys", []))
+
+        state_dims_by_subkey = {
+            key.split(".", 1)[-1]: dim for key, dim in self._state_key_dims.items()
+        }
+        action_dims_by_subkey = {
+            key.split(".", 1)[-1]: dim for key, dim in self._action_key_dims.items()
+        }
+        for key in self._hold_action_keys:
+            if key not in state_dims_by_subkey or key not in action_dims_by_subkey:
+                raise ValueError(
+                    f"hold_action_keys contains {key!r}, but it is not present in "
+                    "both the state and action contracts"
+                )
+            if state_dims_by_subkey[key] != action_dims_by_subkey[key]:
+                raise ValueError(
+                    f"cannot hold {key!r}: state dim {state_dims_by_subkey[key]} "
+                    f"!= action dim {action_dims_by_subkey[key]}"
+                )
 
         logger.info(
             "Gr00tCompatPolicy ready: unnorm_key=%s video order=%s state order=%s "
@@ -162,7 +184,12 @@ class Gr00tCompatPolicy:
         result = self._wrapper.predict_action(examples=[example], unnorm_key=self._unnorm_key)
         actions = np.asarray(result["actions"])  # (B, T, D)
         action_dict = self.split_actions(actions)
-        info = {"unnorm_key": self._unnorm_key, "action_dim": int(actions.shape[-1])}
+        self._apply_action_holds(action_dict, observation)
+        info = {
+            "unnorm_key": self._unnorm_key,
+            "action_dim": int(actions.shape[-1]),
+            "held_action_keys": list(self._hold_action_keys),
+        }
         return action_dict, info
 
     def reset(self, options: Optional[dict] = None) -> Dict[str, Any]:
@@ -287,3 +314,26 @@ class Gr00tCompatPolicy:
                 f"action_key_dims={self._action_key_dims}"
             )
         return out
+
+    def _apply_action_holds(
+        self, action_dict: Dict[str, np.ndarray], observation: Dict[str, Any]
+    ) -> None:
+        """Hold configured absolute-action groups at their latest raw state."""
+        if not self._hold_action_keys:
+            return
+        state_in = observation.get("state")
+        if not isinstance(state_in, dict):
+            raise KeyError(
+                "hold_action_keys requires the observation 'state' modality, "
+                f"but it is missing; configured holds: {self._hold_action_keys}"
+            )
+        state_dims_by_subkey = {
+            key.split(".", 1)[-1]: dim for key, dim in self._state_key_dims.items()
+        }
+        for key in self._hold_action_keys:
+            if key not in state_in:
+                raise KeyError(
+                    f"cannot hold action {key!r}: observation state is missing it"
+                )
+            target = _latest_frame(state_in[key], state_dims_by_subkey[key], key)
+            action_dict[key][...] = target.reshape(1, 1, -1)

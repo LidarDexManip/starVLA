@@ -65,7 +65,10 @@ class VegaWujiPipetteTubeGR00TN1d7DataConfig:
     observation_indices = [0]
     state_indices = [0]
     action_indices = list(range(30))
-    view_resize_hw = (224, 224)
+    # Cosmos-Reason2's Qwen image processor has a 256**2 minimum pixel area.
+    # Resize directly to that effective VLM input size so training performs one
+    # geometric resize instead of 224x224 here followed by an upsample to 256x256.
+    view_resize_hw = (256, 256)
 
     def modality_config(self):
         return {
@@ -141,5 +144,16 @@ DATASET_NAMED_MIXTURES = {
     ],
     "vega_wuji_pipette_grasp_phase00_01_n1d7": [
         ("g1-pipette-tube-drive-phase00-01-global", 1.0, "vega_wuji_pipette_tube_n1d7"),
+    ],
+    "vega_wuji_pipette_grasp_phase00_01_augmented_n1d7": [
+        ("g1-pipette-tube-drive-phase00-01-global", 1.0, "vega_wuji_pipette_tube_n1d7"),
+        ("g1-pipette-tube-reference-phase00-01-global", 1.0, "vega_wuji_pipette_tube_n1d7"),
+    ],
+    "vega_wuji_pipette_grasp_phase00_01_success51_n1d7": [
+        ("g1-pipette-tube-drive-phase00-01-global", 1.0, "vega_wuji_pipette_tube_n1d7"),
+        (
+            "g1-pipette-tube-reference-success42-phase00-01-global", 1.0,
+            "vega_wuji_pipette_tube_n1d7",
+        ),
     ],
 }

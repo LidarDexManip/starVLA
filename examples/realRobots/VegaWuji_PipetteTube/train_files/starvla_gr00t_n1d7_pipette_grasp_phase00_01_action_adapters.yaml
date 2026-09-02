@@ -1,0 +1,127 @@
+# Small-data GR00T-N1.7 adaptation for Vega/Wuji pipette approach + grasp.
+#
+# The Cosmos VLM and the pretrained generic action dynamics stay frozen.  Only
+# the action head's embodiment-conditioned state/action encoders and decoder
+# are trainable.  Since every sample uses embodiment slot 31, autograd updates
+# only that slot's slices inside the category-specific tensors.
+
+run_id: starvla_gr00t_n1d7_vega_wuji_pipette_grasp_phase00_01_right_only_augmented
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: geertswon-georgia-institute-of-technology
+wandb_project: starVLA_vega_wuji_pipette_tube
+is_debug: false
+version_id: "0.1"
+
+framework:
+  name: CosmosGR00TN1d7
+  pretrained_gr00t_n1d7: null
+  embodiment_id: 31
+  tune_llm: false
+  tune_visual: false
+  enable_gradient_checkpointing: true
+  qwenvl:
+    base_vlm: nvidia/Cosmos-Reason2-2B
+    attn_implementation: sdpa
+    select_layer: 16
+  action_model:
+    action_dim: 54
+    state_dim: 54
+    action_horizon: 30
+    max_action_dim: 132
+    max_state_dim: 132
+    state_history_length: 1
+    max_num_embodiments: 32
+    backbone_embedding_dim: 2048
+    input_embedding_dim: 1536
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    use_vlln: true
+    use_alternate_vl_dit: true
+    attend_text_every_n_blocks: 2
+    num_inference_timesteps: 4
+    num_timestep_buckets: 1000
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    state_dropout_prob: 0.2
+    # left_arm[0:7] and left_hand[7:27] are held fixed. Only right_arm and
+    # right_hand contribute to training loss; deployment copies current raw
+    # left-side joint state into every absolute-action command.
+    loss_action_dim_range: [27, 54]
+    hold_action_keys: [left_arm, left_hand]
+    grasp_loss_weight: 1.0
+    grasp_weight_dim: 0
+    grasp_weight_thresh: 0.0
+    diffusion_model_cfg:
+      num_attention_heads: 32
+      attention_head_dim: 48
+      output_dim: 1024
+      num_layers: 32
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      positional_embeddings: null
+    vl_self_attention_cfg:
+      num_attention_heads: 32
+      attention_head_dim: 64
+      num_layers: 4
+      dropout: 0.2
+      final_dropout: true
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /home/jwang3617/pipette/datasets
+    data_mix: vega_wuji_pipette_grasp_phase00_01_augmented_n1d7
+    expected_num_views: 4
+    lerobot_version: v2.0
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 1
+    load_all_data_for_training: true
+    # Match data_registry/data_config.py. The Cosmos processor already uses a
+    # 256**2 minimum, so this is a single geometric resize in both lanes.
+    obs_image_size: [256, 256]
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 4
+
+trainer:
+  # 2,800 optimizer steps at effective batch 32 is about 6.4 passes over the
+  # augmented 17-episode / 14,093-frame Phase 00-01 mixture.
+  max_train_steps: 2800
+  num_warmup_steps: 100
+  save_interval: 400
+  eval_interval: 400
+  learning_rate:
+    base: 1.0e-05
+    action_head: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  # qwen_vl_interface is explicit even though tune_llm/tune_visual already
+  # freeze it, so the optimizer cannot include dormant VLM parameters.  The
+  # generic DiT/VL adapter/position embedding also remain official N1.7.
+  freeze_modules: "qwen_vl_interface,action_head.model,action_head.vl_self_attention,action_head.vlln,action_head.position_embedding"
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 32
+  gradient_checkpointing: true
+  pretrained_checkpoint: null
+  is_resume: false
+  optimizer:
+    name: paged_adamw_8bit
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt

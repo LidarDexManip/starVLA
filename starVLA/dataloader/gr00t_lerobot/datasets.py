@@ -1412,11 +1412,38 @@ class LeRobotSingleDataset(Dataset):
         return self._pack_sample(data)
 
     def _pack_sample(self, data: dict) -> dict:
-        """Pack transformed modality data into training sample format."""
+        """Pack transformed modality data into training sample format.
+
+        ``obs_image_size`` is the train/serve image contract.  The modality
+        transform normally already produced that resolution, so avoid a second
+        interpolation when the size matches.  Configs that do not declare the
+        field retain the historical 224x224 fallback.
+        """
+        configured_size = (
+            self.data_cfg.get("obs_image_size", (224, 224))
+            if self.data_cfg is not None
+            else (224, 224)
+        )
+        if configured_size is None:
+            configured_size = (224, 224)
+        if isinstance(configured_size, (int, float)):
+            target_hw = (int(configured_size), int(configured_size))
+        else:
+            if len(configured_size) != 2:
+                raise ValueError(
+                    "obs_image_size must be an int or [height, width], got "
+                    f"{configured_size!r}"
+                )
+            target_hw = (int(configured_size[0]), int(configured_size[1]))
+        if target_hw[0] <= 0 or target_hw[1] <= 0:
+            raise ValueError(f"obs_image_size must be positive, got {target_hw!r}")
+
+        target_wh = (target_hw[1], target_hw[0])
         step_images = []
         for video_key in self.modality_keys["video"]:
-            image = data[video_key][0]
-            image = Image.fromarray(image).resize((224, 224))
+            image = Image.fromarray(data[video_key][0])
+            if image.size != target_wh:
+                image = image.resize(target_wh)
             step_images.append(image)
 
         language = data[self.modality_keys["language"][0]][0]

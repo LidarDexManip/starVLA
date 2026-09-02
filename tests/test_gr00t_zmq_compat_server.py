@@ -128,11 +128,14 @@ class _StubWrapper:
     """Duck-typed PolicyServerWrapper: records requests, returns a chunk whose
     flat dim d holds the constant value d (so the split is verifiable)."""
 
-    def __init__(self, state_history_length: int = 1):
+    def __init__(self, state_history_length: int = 1, hold_action_keys=None):
         self.requests = []
         # The real wrapper publishes this in the handshake; the adapter sizes
         # its history slice from it.
-        self.metadata = {"state_history_length": state_history_length}
+        self.metadata = {
+            "state_history_length": state_history_length,
+            "hold_action_keys": list(hold_action_keys or []),
+        }
 
     def get_norm_processor(self, unnorm_key=None):
         return _StubProcessor()
@@ -271,6 +274,19 @@ class Gr00tZmqCompatServerTest(unittest.TestCase):
         self.assertEqual(example["state"].shape, (4, sum(STATE_DIMS.values())))
         for row in range(1, 4):
             np.testing.assert_array_equal(example["state"][0], example["state"][row])
+
+    def test_configured_action_groups_are_held_at_latest_raw_state(self):
+        wrapper = _StubWrapper(hold_action_keys=["left_arm", "left_hand"])
+        policy = Gr00tCompatPolicy(wrapper, send_state=True)
+        observation = _bridge_observation(n_hist=2)
+
+        actions, info = policy.get_action(observation)
+
+        np.testing.assert_array_equal(actions["left_arm"], np.full((1, CHUNK, 7), 103.0))
+        np.testing.assert_array_equal(actions["left_hand"], np.full((1, CHUNK, 7), 105.0))
+        # An unheld right-side group still carries the model's prediction.
+        np.testing.assert_array_equal(actions["right_arm"][0, 0], np.arange(7, 14))
+        self.assertEqual(info["held_action_keys"], ["left_arm", "left_hand"])
 
     def test_missing_state_key_is_reported_not_fatal(self):
         obs = _bridge_observation()

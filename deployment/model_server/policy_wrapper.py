@@ -95,6 +95,9 @@ class PolicyServerWrapper:
         # client can size its own ring buffer from the checkpoint.
         self._state_history_length = int(
             action_model_cfg.get("state_history_length", 1))
+        self._hold_action_keys = [
+            str(key) for key in action_model_cfg.get("hold_action_keys", [])
+        ]
 
         # Cache of PolicyNormProcessor instances per unnorm_key.
         # For single-dataset ckpts unnorm_key is auto-selected; for multi-dataset
@@ -158,6 +161,7 @@ class PolicyServerWrapper:
             "training_data_mix": self._model_cfg.get("datasets", {}).get("vla_data", {}).get("data_mix"),
             "training_obs_image_size": _training_obs_image_size(self._model_cfg),
             "state_history_length": self._state_history_length,
+            "hold_action_keys": self._hold_action_keys,
             "eval_image_contract": (
                 "Eval clients must explicitly choose image count and order. "
                 "The server does not infer or reorder camera views from training config."
