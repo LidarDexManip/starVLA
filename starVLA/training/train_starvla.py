@@ -47,7 +47,12 @@ from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
 
-deepspeed_plugin = DeepSpeedPlugin()
+# An unconditional DeepSpeedPlugin forces DeepSpeed on (accelerate flips ACCELERATE_USE_DEEPSPEED
+# to true when a plugin is provided); plain-accelerate DDP runs (ACCELERATE_USE_DEEPSPEED=false)
+# must not construct it. Ported from starVLA_dev (Jiming).
+deepspeed_plugin = (
+    DeepSpeedPlugin() if os.environ.get("ACCELERATE_USE_DEEPSPEED", "false") == "true" else None
+)
 accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
 accelerator.print(accelerator.state)
 
