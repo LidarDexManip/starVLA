@@ -1,0 +1,85 @@
+# EgoVLA (VILA backbone) + flow-matching DiT head on the Vega-U + Wuji pipette/tube task,
+# to-S5 data (reach/grasp -> unrack/slide/fetch tube -> align/press/release), 3 views
+# (ego, side, right wrist), 54-D absolute joint targets, 30-step chunks @ 30 Hz, phase
+# sub-instructions (per-frame task_index). Node paths (/data/hding95).
+
+run_id: egovla_vega_toS5_single_fm
+run_root_dir: /data/hding95/ckpts
+output_dir: /data/hding95/ckpts/egovla_vega_toS5_single_fm
+seed: 42
+is_debug: false
+
+framework:
+  name: EgoVLA
+  qwenvl:
+    base_vlm: /data/hding95/ckpts/ego_vla_checkpoint/ckpt-6720
+    attn_implementation: sdpa
+    use_bf16: true
+    enable_gradient_checkpointing: true
+  # pi0.5-style state dropout: with prob p the (continuous) state fed to the FM head is zeroed
+  state_dropout_prob: 0.8
+  grasp_loss_weight: 1.0
+  false_press_penalty: 0.0
+  overreach_alpha: 0.0
+  reach_motion_weight: 1.0
+  action_model:
+    action_model_type: DiT-B        # flow-matching head (GR00T-style), cross-attends the VILA tokens
+    action_dim: 54
+    state_dim: 54
+    action_horizon: 30
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    repeated_diffusion_steps: 4
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+  input_placeholder_end_token_idx: 151195
+  input_placeholder_start_token_idx: 151375
+  action_query_token_id: 151300
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /data/hding95/datasets
+    data_mix: vega_pipette_toS5_single_3v
+    include_state: true
+    action_mode: abs
+    obs_image_size: [384, 384]
+    per_device_batch_size: 8
+    num_workers: 8
+    video_backend: decord
+    delete_pause_frame: false
+
+trainer:
+  max_train_steps: 20000
+  num_warmup_steps: 200
+  save_interval: 2500
+  eval_interval: 1000
+  logging_frequency: 10
+  learning_rate:
+    base: 5.0e-05
+    vlm: 2.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  gradient_clipping: 1.0
+  freeze_modules: ''
+  is_resume: false
+  save_format: pt
+  optimizer:
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
