@@ -46,6 +46,14 @@ class _EgoVLA_VILA_Interface(nn.Module):
         super().__init__()
         self.config = config
         base = config.framework.qwenvl.base_vlm  # points at the VILA-style checkpoint dir
+        if not os.path.isdir(base):
+            # A checkpoint trained on a cluster bakes that cluster's base_vlm path; when
+            # it's absent (local eval) fall back to the local EgoVLA base VLM so the same
+            # ckpt-6720 (SigLIP + Qwen2) loads without editing the training config.
+            _fallback = "/home/dhy/Projects/EgoVLA_Release/checkpoints/ego_vla_checkpoint/ckpt-6720"
+            if os.path.isdir(_fallback):
+                print(f"[VILA] base_vlm `{base}` not found -> local fallback `{_fallback}`", flush=True)
+                base = _fallback
         attn = getattr(config.framework.qwenvl, "attn_implementation", "sdpa")
         dtype = torch.bfloat16 if getattr(config.framework.qwenvl, "use_bf16", True) else torch.float32
         self.model_dtype = dtype
