@@ -53,7 +53,14 @@ from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_par
 deepspeed_plugin = (
     DeepSpeedPlugin() if os.environ.get("ACCELERATE_USE_DEEPSPEED", "false") == "true" else None
 )
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
+# EgoVLA (and other frameworks with parameters that do not reach the loss, e.g. the VILA
+# lm_head / native query head when a joint/FM head is used) needs find_unused_parameters
+# under multi-GPU DDP, else "Expected to have finished reduction in the prior iteration".
+from accelerate import DistributedDataParallelKwargs
+_ddp_kwargs = DistributedDataParallelKwargs(
+    find_unused_parameters=os.environ.get("DDP_FIND_UNUSED_PARAMETERS", "false").lower() == "true"
+)
+accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin, kwargs_handlers=[_ddp_kwargs])
 accelerator.print(accelerator.state)
 
 # Sane Defaults
