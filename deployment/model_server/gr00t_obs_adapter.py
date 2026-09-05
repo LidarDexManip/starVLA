@@ -111,6 +111,10 @@ class Gr00tCompatPolicy:
         self._state_key_dims: Dict[str, int] = dict(proc.state_key_dims)
         self._action_keys: List[str] = list(proc.action_keys)
         self._action_key_dims: Dict[str, int] = dict(proc.action_key_dims)
+        # Camera views in TRAINING order (from the checkpoint's DataConfig). Reported in the
+        # contract so a client sends exactly these views -- a wrong camera set is silent otherwise.
+        _dc = getattr(proc, "_data_config", None)
+        self._video_keys: List[str] = list(getattr(proc, "video_keys", None) or getattr(_dc, "video_keys", []) or [])
 
         logger.info(
             "Gr00tCompatPolicy ready: unnorm_key=%s state order=%s action split=%s",
