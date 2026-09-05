@@ -144,6 +144,8 @@ class Gr00tCompatPolicy:
             "action_keys": self._action_keys,
             "action_key_dims": self._action_key_dims,
             "unnorm_key": self._unnorm_key,
+            # camera views in TRAINING order -- clients must send exactly these
+            "video_keys": list(self._video_keys),
         }
 
     # -- Conversions -----------------------------------------------------------
