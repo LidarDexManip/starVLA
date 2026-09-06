@@ -33,6 +33,7 @@ def main(args) -> None:
         device="cuda",
         use_bf16=args.use_bf16,
         unnorm_key=args.unnorm_key,
+        robot_type=args.robot_type,
     )
     policy = Gr00tCompatPolicy(
         wrapper,
@@ -69,6 +70,11 @@ def build_argparser():
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--use_bf16", action="store_true")
+    parser.add_argument("--robot_type", type=str, default=None,
+                        help="serve with this DataConfig instead of the one implied by the checkpoint's data_mix. "
+                             "Needed when training used a variant that only makes sense offline (e.g. photometric "
+                             "augmentation, whose video transforms require dataset metadata the server does not have). "
+                             "The override MUST keep the same state/action/video keys and dims.")
     parser.add_argument(
         "--unnorm_key", type=str, default=None,
         help="Dataset statistics key; required for multi-dataset checkpoints.",

@@ -59,8 +59,10 @@ class PolicyServerWrapper:
         device: str = "cuda",
         use_bf16: bool = False,
         unnorm_key: Optional[str] = None,
+        robot_type: Optional[str] = None,
     ) -> None:
         self._ckpt_path = str(ckpt_path)
+        self._robot_type = robot_type
 
         logging.info("PolicyServerWrapper: loading framework from %s", self._ckpt_path)
         framework = baseframework.from_pretrained(self._ckpt_path)
@@ -119,7 +121,7 @@ class PolicyServerWrapper:
         cache_key = unnorm_key if unnorm_key is not None else "__default__"
         if cache_key not in self._norm_processors:
             self._norm_processors[cache_key] = PolicyNormProcessor(
-                self._ckpt_path, unnorm_key=unnorm_key
+                self._ckpt_path, unnorm_key=unnorm_key, robot_type_override=self._robot_type
             )
         return self._norm_processors[cache_key]
 
