@@ -79,6 +79,7 @@ def get_vla_dataset(
     mode: str = "train",
     balance_dataset_weights: bool = False,
     balance_trajectory_weights: bool = False,
+    phase_balanced_sampling: bool = False,
     seed: int = 42,
     **kwargs: dict,
 ) -> LeRobotMixtureDataset:
@@ -109,6 +110,7 @@ def get_vla_dataset(
         mode=mode,
         balance_dataset_weights=balance_dataset_weights,
         balance_trajectory_weights=balance_trajectory_weights,
+        phase_balanced_sampling=phase_balanced_sampling,
         seed=seed,
         data_cfg=data_cfg,
         **kwargs,

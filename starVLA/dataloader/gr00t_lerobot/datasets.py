@@ -2197,6 +2197,7 @@ class LeRobotMixtureDataset(Dataset):
         mode: str,
         balance_dataset_weights: bool = True,
         balance_trajectory_weights: bool = True,
+        phase_balanced_sampling: bool = False,
         seed: int = 42,
         metadata_config: dict = {
             "percentile_mixing_method": "min_max",
@@ -2229,6 +2230,21 @@ class LeRobotMixtureDataset(Dataset):
         self.datasets = datasets
         self.balance_dataset_weights = balance_dataset_weights
         self.balance_trajectory_weights = balance_trajectory_weights
+        # Phase-balanced STEP sampling: within a trajectory, sample steps so that every
+        # task_index (phase) gets equal probability mass instead of every frame. Short but
+        # decisive phases (e.g. a 100-frame finger flick inside a 3000-frame episode) are then
+        # seen as often as long ones. Non-additive: it cannot cancel out when many phases are
+        # short, unlike per-window loss weights.
+        self.phase_balanced_sampling = phase_balanced_sampling
+        self._step_weights: dict[tuple[int, int], np.ndarray] = {}
+        if phase_balanced_sampling:
+            for di, dataset in enumerate(self.datasets):
+                for ti, tid in enumerate(dataset.trajectory_ids):
+                    ph = np.asarray(dataset.get_trajectory_data(tid)["task_index"].to_numpy()).astype(np.int64)
+                    _, inv, counts = np.unique(ph, return_inverse=True, return_counts=True)
+                    w = 1.0 / counts[inv]
+                    self._step_weights[(di, ti)] = w / w.sum()
+            print(f"[phase-balanced sampling] step weights built for {len(self._step_weights)} trajectories")
         self.seed = seed
         self.mode = mode
         self.data_cfg = kwargs["data_cfg"] if "data_cfg" in kwargs else None
@@ -2362,7 +2378,11 @@ class LeRobotMixtureDataset(Dataset):
         trajectory_id = dataset.trajectory_ids[trajectory_index]
 
         # Sample step
-        base_index = rng.choice(dataset.trajectory_lengths[trajectory_index])
+        w = self._step_weights.get((dataset_index, trajectory_index)) if self.phase_balanced_sampling else None
+        if w is not None and len(w) == dataset.trajectory_lengths[trajectory_index]:
+            base_index = rng.choice(len(w), p=w)
+        else:
+            base_index = rng.choice(dataset.trajectory_lengths[trajectory_index])
         return dataset, trajectory_id, base_index
 
     

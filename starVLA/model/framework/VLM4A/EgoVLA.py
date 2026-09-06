@@ -301,7 +301,14 @@ class EgoVLA(baseframework):
                 p = float(self.config.framework.get("state_dropout_prob", 0.8))
                 if p > 0:
                     keep = (torch.rand(s.shape[0], 1, 1, device=s.device) >= p).to(s.dtype)
-                    s = s * keep
+                    # `state_dropout_keep_dims` trailing dims are NEVER dropped: they carry the
+                    # phase one-hot (a hard task-stage signal the policy must always see), while
+                    # the proprioceptive dims in front are still dropped to prevent copycat.
+                    kd = int(self.config.framework.get("state_dropout_keep_dims", 0))
+                    if kd > 0:
+                        s = torch.cat([s[..., :-kd] * keep, s[..., -kd:]], dim=-1)
+                    else:
+                        s = s * keep
             with torch.autocast("cuda", dtype=torch.float32):
                 loss = self.action_model(h, a, s, encoder_attention_mask=m)
             return {"action_loss": loss}
