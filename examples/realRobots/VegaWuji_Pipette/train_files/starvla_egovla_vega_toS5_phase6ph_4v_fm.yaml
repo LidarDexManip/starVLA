@@ -5,7 +5,8 @@
 #      their own phases those frames are ~48 % / ~82 %.
 #   2. Photometric augmentation on the three camera streams (run 1 had none; 128 near-identical
 #      scripted demos -> the policy drifted out of distribution within ~300 steps).
-# RUN 3 adds, on top of run 2: (3) a 6-dim PHASE ONE-HOT appended to the state (never dropped by
+# RUN 3 adds, on top of run 2: (3) a 16-dim PHASE ONE-HOT appended to the state (phases 0-5 used
+# now, dims 6-15 reserved for the full task; never dropped by
 # state dropout) so the task stage is a hard signal instead of text the image can override;
 # (4) PHASE-BALANCED step sampling (each phase gets equal probability mass; non-additive, so it
 # does not cancel with many short phases); (5) ALL FOUR cameras again - the tube is ~4 px wide
@@ -28,7 +29,7 @@ framework:
     enable_gradient_checkpointing: true
   # pi0.5-style state dropout: with prob p the (continuous) state fed to the FM head is zeroed
   state_dropout_prob: 0.8
-  state_dropout_keep_dims: 6   # the phase one-hot (state dims 54..59) is never dropped
+  state_dropout_keep_dims: 16   # the phase one-hot (state dims 54..69) is never dropped
   grasp_loss_weight: 1.0
   false_press_penalty: 0.0
   overreach_alpha: 0.0
@@ -36,7 +37,7 @@ framework:
   action_model:
     action_model_type: DiT-B        # flow-matching head (GR00T-style), cross-attends the VILA tokens
     action_dim: 54
-    state_dim: 60
+    state_dim: 70
     action_horizon: 30
     hidden_size: 1024
     add_pos_embed: true

@@ -104,13 +104,14 @@ class VegaWujiEgoOnlyDataConfig(_VegaWujiBase):
 
 
 class _VegaWujiPhaseState(_VegaWujiBase):
-    """54-D proprio + 6-D phase one-hot in observation.state (dataset rft_pipette_toS5_phase6ph).
+    """54-D proprio + 16-D phase one-hot (phases 0-5 used now; 6-15 reserved for the full task)
+    in observation.state (dataset rft_pipette_toS5_phase6ph), i.e. a 70-D state.
     The one-hot is a hard task-stage signal; EgoVLA's state dropout leaves it intact
-    (framework.state_dropout_keep_dims: 6). At serve time the runner appends its event-ladder
+    (framework.state_dropout_keep_dims: 16). At serve time the runner appends its event-ladder
     phase as state.phase. Uses ALL FOUR cameras: the left wrist view is the only close-up of the
     tube, and the tube is ~4 px wide in the head camera."""
     state_keys = ["state.left_arm", "state.left_hand", "state.right_arm", "state.right_hand", "state.phase"]
-    state_key_dims = {"state.left_arm": 7, "state.left_hand": 20, "state.right_arm": 7, "state.right_hand": 20, "state.phase": 6}
+    state_key_dims = {"state.left_arm": 7, "state.left_hand": 20, "state.right_arm": 7, "state.right_hand": 20, "state.phase": 16}
     video_keys = ["video.ego_view", "video.side_view", "video.left_wrist_view", "video.right_wrist_view"]
 
 
