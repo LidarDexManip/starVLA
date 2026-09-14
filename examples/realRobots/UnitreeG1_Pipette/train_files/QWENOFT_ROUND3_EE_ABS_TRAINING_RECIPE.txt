@@ -1,0 +1,804 @@
+================================================================================
+QwenOFT ROUND 3 - ABSOLUTE RIGHT-HAND XYZ, NO STATE
+Training recipe / settings record
+================================================================================
+
+run_id      starvla_qwenoft_pipette_3view_hil293_ee_abs_nostate
+launched    2026-09-13 04:17:25 (node-2 clock), node 2 = jren313@100.121.16.2,
+            GPUs 4-7 (B200, 183,359 MiB each), rendezvous port 29923
+config      examples/realRobots/UnitreeG1_Pipette/train_files/
+            starvla_qwenoft_pipette_3view_hil293_ee_abs_nostate.yaml
+task        "Attach a green pipette tip from the tip rack to the pipette."
+written     2026-09-13 at step ~1400/24000; every number below was verified
+            against its source artefact (run dir, dataset meta, source, or log)
+
+NOTE ON CLOCKS: node 2 runs ~12 h ahead of the workstation. All log timestamps
+in this document are node-2 local time.
+
+--------------------------------------------------------------------------------
+0. SUMMARY IN ONE PARAGRAPH
+--------------------------------------------------------------------------------
+QwenOFT (Qwen3-VL-4B + a 65.6 M-parameter MLP head, 4,503.4 M parameters total,
+100% trainable) is fine-tuned on 249 teleop episodes of the G1 pipette-tip task.
+The policy sees three 256x256 camera views and one frame per view - it is
+memoryless - and emits a 30-row chunk of ABSOLUTE right-hand Cartesian positions
+(x, y, z in metres, pelvis frame) at 60 Hz. No proprioceptive state is fed to the
+model in this arm. 15% of episodes are held out and scored every 500 steps
+against a "freeze the hand at the chunk's first row" baseline. This round exists
+because the round-2 head, which predicted PER-STEP DELTAS, collapsed to exact
+zeros on the real robot.
+
+--------------------------------------------------------------------------------
+1. WHY THIS ROUND EXISTS - THE ROUND-2 POST-MORTEM
+--------------------------------------------------------------------------------
+Round 2 trained the same model on `action.right_ee_dxyz`: the per-step change in
+hand position, FK(cmd[t+1]) - FK(cmd[t]) at 60 Hz. Both A/B arms beat their
+offline baseline, but on the real robot both STALLED at the same place: with the
+pipette hovering directly above the tip, the arm stopped and never resumed.
+
+Flight-recorder evidence (host path; the container's --home bind):
+  /tmp/wbc_home/.local/state/policy_bridge/flight/<ts>_<profile>/events.jsonl.gz
+  "rec":"chunk" records carry step_mean / step_max / net of the CONVERTED chunk.
+  Session 20260912_1917xx (state arm): the zero-chunk fraction climbed
+  29% -> 50% -> 85% -> 95% and hit 100% at t~210 s, then held 100% for 6+
+  minutes. All 30 rows byte-identical, i.e. |dxyz| < 0.01 mm per step - two
+  orders of magnitude below the 0.12 mm median of a real training step.
+
+Two causes, and they compound:
+
+  (a) ZERO-INFLATED LABELS - measured, not estimated.
+      The teleop command stream runs at ~50 Hz while the recorder runs at 60 Hz,
+      so whenever two consecutive recorded frames share a command the difference
+      is EXACTLY zero - bit-for-bit, and always as a WHOLE ROW (the exact-zero
+      fraction is identical for x, y and z, because it is the commanded joint
+      vector that did not change). Measured over the parquet:
+
+          exact-zero delta rows   39.688%  train   (121,799 / 306,891)
+                                  40.873%  eval    ( 22,936 /  56,115)
+                                  39.871%  all 293 (144,735 / 363,006)
+
+          |d| over ALL rows       median 0.1129 mm, mean 0.1263 mm,
+                                  q01 = q05 = q25 = 0.000 mm (the zero mass
+                                  swallows the entire lower quartile),
+                                  q95 0.3750, q99 0.6939, max 30.297 mm
+          |d| EXCLUDING zeros     q01 0.0171, median 0.1199, q99 0.7598 mm
+                                  (n = 185,092)
+
+      Zero-run structure: 43,574 runs, 89.66% of length 1, 6.99% of length >= 3,
+      longest 691 frames (11.5 s). Per-episode zero fraction ranges 23.3% to
+      67.0%. Two distinct regimes are visible - interleaved single-frame zeros
+      (the 50/60 Hz beat) and long deliberate holds - and a memoryless policy
+      cannot tell them apart from one frame.
+
+      (The data_config docstring says "34-45%"; the measured dataset-wide figure
+      is 39.9% and the per-episode spread is more than twice as wide as that
+      band. Quote 39.7% / 39.9%, not the band.)
+
+      An MSE/L1 head learns the conditional statistic of the label given the
+      observation; at the hover-above-tip scene, where the operator's alignment
+      pauses concentrate, that statistic is pulled onto the zero spike. The model
+      is not "moving too little" - its optimal answer under the training
+      distribution IS zero.
+
+  (b) A MEMORYLESS POLICY IN CLOSED LOOP MAKES ZERO AN ABSORBING STATE.
+      Output zero -> the integrated command does not change -> the robot does not
+      move -> the next observation is pixel-identical -> output zero again. There
+      is no clock and no history that can break the cycle.
+
+The control that proves (a) is scene-specific rather than static-input-driven:
+session 20260912_1902xx ran with the robot frozen at the EPISODE START pose (a
+serving bug meant no command was ever published), and there the model emitted 0%
+zero chunks for five straight minutes - it kept asking to descend. Staring at a
+still image does not by itself produce zeros; staring at THIS still image does.
+
+HOW GOOD WAS ROUND 2, REALLY? Its baseline predicted exactly zero, and 40.9% of
+eval-split delta labels ARE exactly zero. "Hold still" was therefore not a naive
+competitor - it was literally correct on two of every five holdout steps. Read in
+that light, the best arm's mse_ratio of 0.747 says the policy was only 25% better
+than a predictor that is exactly right 41% of the time and exactly wrong the
+rest. That is the single strongest argument for changing the label space.
+
+Fix: make the label space one in which "do nothing" has no shared special value.
+With absolute targets, a demonstration pause labels "hold THIS pose" - a
+scene-dependent continuous value. No probability spike is shared across the
+dataset, so the collapse cannot be expressed.
+
+Expected ordering of action spaces, unchanged from the earlier analysis:
+  absolute  >=  chunk-relative (cumulative)  >  per-step delta
+Round 3 tests the top of that ordering. No dataset rebuild was needed: the
+absolute column was written alongside the deltas when the -ee dataset was built.
+
+--------------------------------------------------------------------------------
+2. DATA
+--------------------------------------------------------------------------------
+Family           g1-pipette-3view-hil293-ee = hil293 parquet + 3 added FK columns
+Local            /home/jren313/Datasets/      Node 2  /data/jren313/datasets
+                                                      (~/Datasets symlinks to it)
+
+  ...-ee          293 episodes / 363,006 frames   <- holds the only real parquet
+  ...-ee-train    249 episodes / 306,891 frames   \  symlink trees into the
+  ...-ee-eval      44 episodes /  56,115 frames   /  parent; videos symlink to
+                                                     hil293, so near-zero disk
+  fps 60, robot_type unitree_g1_29dof_inspire, LeRobot codebase_version v2.1
+
+Split            15% of EPISODES, seed 1234, `random.Random(1234).shuffle` over
+                 the sorted ids, first 44 -> eval. Recorded in meta/splits.json
+                 (md5 93a88fdd9905cd1bcf318f3b18210574, byte-identical in all
+                 three dirs). Verified disjoint and exhaustive.
+Eval episodes    2, 24, 34, 57, 63, 64, 66, 74, 83, 84, 103, 105, 113, 140, 143,
+                 146, 156, 166, 180, 183, 186, 188, 189, 191, 192, 193, 196, 200,
+                 204, 215, 227, 233, 240, 251, 261, 262, 274, 276, 278, 279, 288,
+                 290, 291, 292
+Native views     video.rgb 720 x 1280,  video.wrist_left 1080 x 1080,
+                 video.wrist_right 1080 x 1080
+
+*** TRAP: meta/info.json also carries a `splits` key reading {"train": "0:249"}
+(and "0:44" in the eval dir). That is a LeRobot build artefact, NOT a second
+split. meta/splits.json is the real one. ***
+
+STATISTICS ARE TRAIN-ONLY, AND THE EVAL DIR CARRIES A COPY.
+meta/stats_gr00t.json is byte-identical in the train and eval dirs
+(md5 048201abbd68956537833ba3d6a57e54, same on node 2), and recomputing q01/q99
+over the 249 train parquets reproduces its action.right_ee_xyz values exactly.
+This matters because the loader computes/caches q99 statistics by globbing
+data/*/*.parquet of whatever directory it is pointed at: without the copy, the
+holdout would be normalised with the HOLDOUT's own quantiles and the two splits
+would be measured on different scales. For contrast, the eval split's own
+quantiles are [0.18853, -0.099025, 0.024846] / [0.32525, 0.050846, 0.105016] -
+visibly wider in x and z.
+
+16.33% of eval rows fall outside the train q01..q99 box on at least one axis
+(normalised eval range min [-1.433, -1.182, -1.263], max [1.325, 0.882, 1.330]).
+That is expected for a q99 scheme, but it is worth knowing that the holdout
+genuinely visits poses the train box clips.
+
+--------------------------------------------------------------------------------
+3. ACTION SPACE  (the one thing that changed from round 2)
+--------------------------------------------------------------------------------
+Key              action.right_ee_xyz          3 dims, metres, pelvis frame
+Definition       FK(commanded 29 joints at t+i) for row i - the absolute position
+                 of the right hand the operator ASKED for.
+Endpoint         link `right_rubber_hand`, reached through the FIXED
+                 right_hand_palm_joint (origin xyz "0.0415 -0.003 0") from
+                 right_wrist_yaw_link.
+URDF             ~/Downloads/TWIST2/assets/g1/g1_29dof_rev_1_0.urdf, stock
+                 Unitree 29-DoF, md5 d876577e7d3e9eaaa84a32a608bc494a. The
+                 bridge's vendored copy
+                 vla_policy_bridge/robots/vendor_twist2/g1_29dof_rev_1_0.urdf is
+                 byte-identical. The bridge's OTHER file, g1_29dof_with_hand.urdf,
+                 disagrees by up to 14 mm and must NOT be used.
+Chain            10 moving joints: waist_yaw, waist_roll, waist_pitch, then
+                 right_shoulder_pitch/roll/yaw, right_elbow,
+                 right_wrist_roll/pitch/yaw. WAIST IS IN THE CHAIN - waist motion
+                 moves the label. Legs and left arm do not.
+FK check         max |dxyz| = 5.55e-17 m against the bridge's UrdfKinematics over
+                 64 random configurations - machine precision.
+Commanded,       The commanded and measured hand positions differ by ~20 mm in
+not measured     this data (the TWIST2 whole-body policy tracks the reference
+                 with droop). The labels are the COMMAND, so serving must speak
+                 in commands too.
+Horizon          30 rows = 0.5 s at 60 Hz (the bridge chunk contract; pi0.5 used
+                 10 rows at 30 Hz).
+Normalisation    q99 over the train split:
+                   q01  [0.198683, -0.089723, 0.029632]  m
+                   q99  [0.314678,  0.065839, 0.103007]  m
+                   span [115.995,   155.562,   73.375 ]  mm
+                   half [ 57.998,    77.781,   36.688 ]  mm  <- the mm conversion
+                   mean [0.2609, -0.0251, 0.0654] m
+                 1 mm of physical error is 1.7% / 1.3% / 2.7% of the normalised
+                 range - comfortably inside what a regression head resolves.
+modality.json    action.right_ee_xyz carries NO `absolute: false` flag (unlike
+                 action.right_ee_dxyz, which does), so the loader treats it as an
+                 absolute target. The yaml still says `action_mode: abs` because
+                 the values are direct targets.
+
+Label-distribution check (scratchpad smoke_ee_abs.py, 120 random eval chunks,
+transforms in eval mode):
+  normalised action range              [-1.160, 1.310]
+  chunks that are fully static         11.7%   (vs 39.7% exact-zero STEPS in the
+                                                delta space)
+  consecutive duplicate rows           44.9%   (the 50 Hz artefact; harmless here
+                                                - a duplicate row is a repeated
+                                                POSITION, not a zero)
+  median |net displacement| per chunk  0.0757 normalised
+
+That 11.7% is the honest residual: chunks where the hand really does not move for
+a full half second. It is not a shared value, so it cannot act as an attractor
+the way the delta spike did.
+
+--------------------------------------------------------------------------------
+4. STATE
+--------------------------------------------------------------------------------
+include_state    false          <- THIS is the real switch
+state_dim        0              <- inert: nothing in QwenOFT reads it; it is
+                                  documentation of intent
+
+This arm feeds the model NO proprioception. The mechanism: QwenOFT prepends
+discretised state tokens only `if "state" in examples[0]`, and with
+include_state false the loader never packs the key, so the instruction is never
+augmented.
+
+The DataConfig still DECLARES the 32-dim state block it inherits (left_leg 6 +
+right_leg 6 + waist 3 + left_arm 7 + right_arm 7 + right_ee_xyz 3, in that
+concatenation order) so a with-state twin can reuse the config and so the
+serve-time key contract stays discoverable.
+
+Rationale for going no-state: in round 2 the no-state arm scored BETTER (final
+ratio 0.7469 vs 0.8081), the with-state arm actually OVERFIT (section 11), and
+both stalled identically on the robot - so state was not what was broken. One arm
+is enough to test the action-space hypothesis.
+
+--------------------------------------------------------------------------------
+5. VIEW PIPELINE AND AUGMENTATION  (inherited unchanged from round 2)
+--------------------------------------------------------------------------------
+video_keys       video.rgb, video.wrist_left, video.wrist_right - consumed
+                 POSITIONALLY in this order
+Working size     256 x 256 for all three views (round 1 had ego 256 + wrists 448)
+Constants        VIEW_SIZE 256, PRE_CROP 270, CROP_FRAC 0.95, ROT_DEG 5.0, with a
+                 class-body `assert int(270*0.95) == 256` that fires at import.
+
+18 transforms in one ComposedModalityTransform: 12 per-view + 6 shared.
+
+PER VIEW (4 transforms x 3 views, each scoped to one key):
+   VideoToTensor
+   VideoResize            270 x 270, bilinear
+   VideoRandomRotation    +/- 5 deg, bilinear             [train only]
+   VideoCrop              scale 0.95 -> 256 x 256         [RandomCrop train,
+                                                           CenterCrop eval]
+SHARED (one draw for all three views - one scene, one sensor):
+   VideoColorJitter       brightness 0.3, contrast 0.4, saturation 0.5, hue 0.08
+   VideoColorTemperature  strength 0.15
+   VideoToNumpy
+   StateActionToTensor    (state + action keys)
+   StateActionTransform   (state keys, all q99)
+   StateActionTransform   (action keys, q99)
+
+Per-view vs shared is a real mechanism, not a convention: one random draw happens
+per transform CALL. Geometric transforms have apply_to=[one key], so three calls
+= three independent draws (independent camera-pose jitter). Colour transforms
+have apply_to=[all three], so the views are concatenated and ONE draw is shared.
+
+Three details worth knowing:
+
+  * THE RESIZE IS AN ANISOTROPIC SQUASH. T.Resize((270,270)) is a square target,
+    so the 720x1280 ego view is squashed from aspect 1.778 to 1.0. The wrist
+    views are 1080x1080 and unaffected. serve_view_preprocess reproduces the same
+    squash, so train and serve agree - the squash is the CONTRACT, not a bug, and
+    the bridge must hand the ego view at its own native aspect.
+  * ROTATION LEAVES BLACK CORNERS. T.RandomRotation defaults to expand=False,
+    fill=0. Rotating a 270-px square by 5 deg leaves a largest safe inscribed
+    square of 270/(cos5+sin5) = 249.2 px, which is SMALLER than the 256 crop, so
+    every rotated training sample keeps a small zero-filled corner wedge (~7 px
+    at the extreme). Eval and serving skip rotation entirely and never show black
+    corners - a mild train/serve asymmetry, stated here so nobody rediscovers it.
+  * THE PER-VIEW SCOPING IS LOAD-BEARING. VideoCrop.get_transform asserts that
+    all views it is applied to share one native resolution. This dataset has
+    720x1280 and 1080x1080 views, so a SHARED VideoCrop would fail the assert.
+    It passes only because each VideoCrop instance is scoped to one key.
+
+Eval/serve mode collapses the whole chain to: resize 270x270 -> centre-crop 256,
+per view, no colour change. The switch is `transforms.eval()`, applied per
+dataset object (train_starvla.py for the holdout; policy_norm_processor for
+serving).
+
+*** SERVING CONSEQUENCE - do not skip this ***
+A server that resizes STRAIGHT to 256 shows the model 5% more field of view than
+it ever saw. The DataConfig therefore exposes `serve_view_preprocess(images)`:
+PIL resize to 270x270 bilinear, then slice [7:263, 7:263]. The server calls it
+through
+  deployment/model_server/policy_norm_processor.py   -> `data_config` property
+  deployment/model_server/gr00t_obs_adapter.py       -> obs_to_example()
+After that hook the framework's own obs_image_size resize is a no-op. This is
+identical to the round-2 contract and does NOT change for an absolute head.
+
+--------------------------------------------------------------------------------
+6. MODEL AND OPTIMISER
+--------------------------------------------------------------------------------
+framework            QwenOFT  (FRAMEWORK_REGISTRY 'QwenOFT' -> Qwenvl_OFT)
+base_vlm             /data/jren313/models/Qwen3-VL-4B-Instruct (node-local
+                     snapshot; see TRAP 4 for serving the checkpoint locally)
+                     text hidden_size 2560, 36 text layers, dtype bfloat16
+action head          MLPResNet(num_blocks=2, in 2560, hidden 5120, out 3),
+                     applied per action token: (B, 30, 2560) -> (B*30, 2560)
+                     LN -> Linear(2560,5120) -> ReLU -> 2 pre-LN residual blocks
+                     -> LN -> Linear(5120,3).   65,602,563 params (derived)
+loss                 plain L1 (nn.L1Loss) over the 3 x 30 chunk
+                     *** logged as `action_dit_loss` - a legacy key name from the
+                     diffusion heads. There is no DiT here. ***
+parameters           4,503.418 M total, 4,503.418 M trainable (100%)
+                     implied backbone 4,437.8 M (derived)
+fine-tuning          FULL, freeze_modules '' - nothing frozen
+seed                 42 (per-rank seed = 42 + rank, so 42/43/44/45)
+mixed precision      accelerate runs with mixed_precision=no; bf16 comes from the
+                     weight dtype plus explicit torch.autocast blocks
+
+learning rates (cosine_with_min_lr, warmup 600 steps = 2.5%):
+   qwen_vl_interface   1.0e-05 peak   (713 parameter tensors - the whole backbone)
+   action_model        1.0e-04 peak   (16 parameter tensors - 10x the backbone)
+   base                2.5e-05        (see the gotcha below)
+optimizer            torch.optim.AdamW, fused=True (hardcoded), betas (0.9, 0.95),
+                     eps 1e-08, weight_decay 1e-08
+gradient clipping    1.0, applied every micro-batch inside the accumulate block
+save_interval        5000        eval_interval 500       logging_frequency 10
+save_format          pt (torch.save of the full 4.5 B bf16 state dict; not
+                     safetensors)
+wandb                offline, run dir <run_dir>/wandb/wandb/offline-run-...
+                     (the API key is deliberately NOT on node 2 - `wandb sync`
+                     from the workstation later)
+
+FIVE CONFIG GOTCHAS, all verified in source:
+
+  1. GRADIENT CHECKPOINTING IS DECLARED BUT NOT ACTIVE.
+     Both framework.qwenvl.enable_gradient_checkpointing and
+     trainer.gradient_checkpointing are true in the resolved config, and NEITHER
+     has a reader on the QwenOFT / Qwen3-VL path. Corroborated by memory: ~86 GB
+     resident per GPU at per-device batch 16 on a B200. If you ever need the
+     memory, you will have to wire it up - the yaml does not do it.
+
+  2. `min_lr: 1.0e-06` IS NOT THE FLOOR ANY GROUP REACHES.
+     transformers converts min_lr to a RATIO against the optimizer's default lr,
+     i.e. learning_rate.base:  1e-6 / 2.5e-5 = 0.04. The actual final-step floors
+     are therefore  action_model 4.0e-06  and  qwen_vl_interface 4.0e-07. The
+     name is misleading whenever a yaml has several per-group LRs.
+
+  3. `learning_rate.base` GOVERNS ZERO PARAMETERS - but is still load-bearing.
+     Only two param groups are created (qwen_vl_interface, action_model); the
+     'base' group is only added if leftover params exist, and there are none. But
+     base IS passed as AdamW's default lr, which is what gotcha 2 divides by.
+
+  4. `attn_implementation: sdpa` IS INERT - the Qwen3-VL path hard-forces sdpa
+     regardless, so flash_attention_2 cannot be selected from the yaml at all.
+
+  5. TWO DEAD KEYS. `trainer.weight_decay: 0.0` is dead (the live one is the
+     nested trainer.optimizer.weight_decay = 1e-08) and `trainer.max_grad_norm`
+     is dead (the live one is trainer.gradient_clipping). Both happen to be
+     harmless here, but do not "fix" them expecting an effect.
+
+Also injected by dataclass defaults, not present in the yaml:
+  grasp_loss_weight 1.0 / grasp_weight_dim 25 / grasp_weight_thresh -0.143
+  -> press-phase weighting DISABLED (1.0 == plain L1); grasp_weight_dim 25 would
+  be out of range for a 3-dim action anyway.
+  future_action_window_size 29 / past_action_window_size 0 (derived from
+  action_horizon 30 by the config-compat normalisation).
+
+--------------------------------------------------------------------------------
+7. BATCH ARITHMETIC AND SCHEDULE
+--------------------------------------------------------------------------------
+   per_device_batch_size      16
+ x gradient_accumulation      2       (REAL on the plain-accelerate path, and it
+                                       comes ONLY from the env var
+                                       ACCELERATE_GRADIENT_ACCUMULATION_STEPS -
+                                       the Accelerator is built at import)
+ x num_processes (GPUs)       4
+ ------------------------------------
+   GLOBAL BATCH              128      (reported by the run itself)
+
+   24,000 optimizer steps x 128 = 3,072,000 samples
+   3,072,000 / 306,891 train frames = 10.0101 EPOCHS
+
+*** THE LOGGED `epoch` NUMBER UNDERCOUNTS BY 2x. *** It is
+completed_steps / len(per-rank dataloader) and ignores gradient accumulation, so
+at step 24000 it will read ~5.0, not ~10.0. The 10.0 above is the true figure.
+
+Why 16 x 2 and not 32 x 1: 32 x 1 fits in memory on an idle B200 (~117 GB), but
+round 2 launched while another user held 66 GB on GPU 0. 16 x 2 was kept for
+round 3 so the three runs stay byte-comparable.
+num_workers 12 (at 4 both round-2 arms were data-bound at ~1.6 s/it),
+prefetch_factor 2, persistent_workers, pin_memory.
+
+Observed: 1.18-1.28 s/step on GPUs 4-7 -> ~7.5-8.3 h for 24,000 steps. GPU 5 is
+shared with another user's small job; that rate already includes it.
+
+Checkpoints land at steps 5000 / 10000 / 15000 / 20000 as
+`checkpoints/steps_<N>_pytorch_model.pt`. 24000 is NOT a multiple of 5000, so
+there is no step-24000 checkpoint - the final weights exist only as
+`<run_dir>/final_model/pytorch_model.pt` (~9.14 GB).
+
+--------------------------------------------------------------------------------
+8. HOLDOUT EVAL PROTOCOL
+--------------------------------------------------------------------------------
+Opt-in key    datasets.vla_data.eval_data_mix (unset -> no holdout eval at all)
+Mixture       unitree_g1_pipette_3view_oft_ee_abs_eval_mix -> the -ee-eval dir.
+              A different DIRECTORY from the train mixture, which is what makes
+              the disjointness episode-level and structural.
+Sampling      Rank r takes the contiguous block [r*K*B, (r+1)*K*B) with
+              K = eval_num_batches = 4 and B = eval_batch_size (unset, so it
+              silently tracks per_device_batch_size = 16). 4 x 16 x 4 ranks =
+              256 fixed samples = 7,680 (sample, step) rows = 23,040 scalars.
+              Only the first 256 of the 56,115 eval frames are ever scored.
+Determinism   The mixture is built in mode="val", where the sampler's seed is the
+              raw index, so index -> (episode, frame) is a pure function,
+              independent of epoch and global seed. The batches are decoded ONCE
+              at startup and kept in RAM; each evaluation is 4 forward passes per
+              rank with no dataloader involved.
+              Empirical proof they are the same samples every time: the baseline
+              mse_zero_action is bit-identical (0.0008697964696349001) at steps
+              0, 500 and 1000.
+Views         transforms.eval() - centre crop, no rotation, no colour jitter,
+              i.e. exactly the pixels the policy server produces.
+Metrics       eval/mse_holdout       MSE over 23,040 scalars, NORMALISED space
+              eval/mse_zero_action   the same for the hold-still baseline
+              eval/mse_ratio         holdout / baseline. < 1 beats holding still.
+                                     THIS IS THE NUMBER.
+              eval/rmse_dim{i}       per-dim RMSE x half_span -> METRES
+              eval/rmse_dim{i}_zero  the baseline's, same conversion
+              All sums are all-reduced (SUM) before the means, so every logged
+              number is over all 256 samples on all 4 ranks.
+
+*** THE BASELINE SWITCH - new in round 3 ***
+  datasets.vla_data.eval_baseline: hold_first      (default is still "zero")
+
+  "zero"       base = the normalised image of the PHYSICAL zero action, one
+               constant vector repeated everywhere.
+  "hold_first" base = each sample's OWN first target row, repeated over the
+               horizon. Per-sample, and checked BEFORE the zero branch, so it
+               works even if dataset_statistics.json is unreadable.
+
+Why physical zero is meaningless here, concretely: the action is the absolute
+hand position in the PELVIS frame, so xyz = (0,0,0) is the pelvis origin - about
+0.26 m from the mean commanded hand position. Normalised, that point is
+[-4.426, +0.154, -1.808], and the first component is driven right off the end of
+the +/-2.2 clamp, so under `zero` the "baseline" is not even a consistent
+physical point - it is a clamped artefact. In a DELTA space the zero vector
+genuinely means "do not move" and is a fair competitor; in an absolute space it
+means "teleport the hand into the robot's pelvis".
+
+Metric KEY NAMES are deliberately unchanged across modes so round-2 and round-3
+dashboards overlay cleanly. THE CONSEQUENCE IS A TRAP: mse_ratio is NOT
+comparable between rounds, because the denominators are different baselines.
+Compare the PHYSICAL per-dim RMSE instead.
+
+The round-3 baseline, measured at step 0 and constant thereafter:
+   mse_zero_action  8.698e-04
+   rmse_dim0_zero   1.8786 mm   (x)
+   rmse_dim1_zero   1.1678 mm   (y)
+   rmse_dim2_zero   1.3404 mm   (z)
+Read that as: freezing the hand at the start of every half-second window leaves
+you 1.2-1.9 mm RMS off per row. That is literally how far the commanded hand
+travels in half a second on the held-out episodes, and it is the bar.
+
+SANITY CHECK: if hold_first were NOT active, the baseline in this action space
+would be order 0.8, not 8.7e-04. A baseline that small is proof the switch took.
+
+TWO SMALL QUIRKS
+  * Every eval_interval fires TWICE (two identical 'holdout eval: step500'
+    records), because completed_steps only advances on sync_gradients and
+    gradient_accumulation_steps = 2. Step 0 fires once. Harmless: ~2 s of GPU and
+    a duplicate wandb point with identical eval values.
+  * eval_action_model runs immediately before eval_holdout and scores the CURRENT
+    TRAINING batch (in-sample `mse_score`). It consumes one extra training batch
+    per fire and is NOT comparable to eval/mse_holdout.
+
+--------------------------------------------------------------------------------
+9. HOW TO LAUNCH
+--------------------------------------------------------------------------------
+On node 2 everything is in ~/launch_ee_abs.sh, which sets the environment and
+execs the repo launcher. IT DOES NOT DAEMONISE OR REDIRECT - unlike round 2's
+launch_oft_ee.sh, it ends in a bare `exec bash <repo launcher>`, so the caller
+supplies nohup / & / the log path:
+
+   ssh jren313@100.121.16.2 'nohup ~/launch_ee_abs.sh \
+       > /data/jren313/starvla_outputs/oft_ee_abs_nostate.log 2>&1 < /dev/null &'
+
+THE ENV RECIPE IS LOAD-BEARING. Every line has cost someone a session:
+
+   export PATH="$HOME/miniconda3/envs/starVLA/bin:$PATH"   # TRAP 2
+   export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+   export WANDB_MODE=offline
+   export NCCL_NVLS_ENABLE=0                               # TRAP 1
+   export DDP_FIND_UNUSED_PARAMETERS=true                  # QwenOFT needs it
+   export TMPDIR=/data/jren313/tmp                         # TRAP 3
+   export TRITON_CACHE_DIR=/data/jren313/tmp/triton
+   export TORCHINDUCTOR_CACHE_DIR=/data/jren313/tmp/inductor
+   export CUDA_VISIBLE_DEVICES=4,5,6,7
+   export MAIN_PROCESS_PORT=29923   # round 2: 29921 state / 29922 nostate
+   export NUM_PROCESSES=4           # <2 silently drops --multi_gpu (see below)
+   export CONFIG_YAML=.../starvla_qwenoft_pipette_3view_hil293_ee_abs_nostate.yaml
+   export DATA_MIX=unitree_g1_pipette_3view_oft_ee_abs_train_mix
+   export RUN_ID=starvla_qwenoft_pipette_3view_hil293_ee_abs_nostate
+   export BASE_VLM=/data/jren313/models/Qwen3-VL-4B-Instruct
+   export PER_DEVICE_BATCH_SIZE=16 GRAD_ACCUM_STEPS=2 NUM_WORKERS=12
+   export MAX_TRAIN_STEPS=24000 NUM_WARMUP_STEPS=600
+   export SAVE_INTERVAL=5000 EVAL_INTERVAL=500
+
+The repo launcher adds `--multi_gpu` ONLY when NUM_PROCESSES > 1. Without it,
+accelerate silently runs N unsynchronised single-process copies - it looks like a
+slow run, not a misconfiguration.
+
+BEFORE LAUNCHING, pre-create the run dir as a symlink into /data (TRAP 3):
+   mkdir -p /data/jren313/starvla_outputs/$RUN_ID
+   ln -s /data/jren313/starvla_outputs/$RUN_ID ~/Projects/starVLA/outputs/starvla/$RUN_ID
+
+Registry names this run depends on (data_registry/data_config.py):
+   robot_type   unitree_g1_pipette_3view_oft_ee_abs            (line 1149)
+   train mix    unitree_g1_pipette_3view_oft_ee_abs_train_mix  (line 1357)
+   eval mix     unitree_g1_pipette_3view_oft_ee_abs_eval_mix
+   class        Pipette3ViewOFTEEAbsDataConfig(Pipette3ViewOFTEEDataConfig)
+                overrides EXACTLY three attributes - action_keys,
+                action_key_dims, action_normalization_modes. Views, augmentation,
+                state block, indices and serve_view_preprocess are all inherited,
+                which is what keeps the comparison with round 2 controlled.
+   discovery    registry.py auto-scans examples/*/train_files/data_registry/
+
+ENVIRONMENT: conda env `starVLA` at ~/miniconda3/envs/starVLA, transformers
+4.57.0, torchvision 0.22.0+cu128.
+
+--------------------------------------------------------------------------------
+10. TRAPS
+--------------------------------------------------------------------------------
+TRAP 1 - NCCL_NVLS_ENABLE=0, or the run wedges with no error at all.
+  Symptom: the log stops after the four per-rank "Using mixture" lines and never
+  prints "Dataset lengths". Every rank burns ~100% SYSTEM time with essentially
+  zero USER time, rchar frozen, each holding exactly 1078 MiB (a bare CUDA
+  context, no NCCL buffers). It reads as a dead job, not a fault.
+  Cause: nvidia-fabricmanager on node 2 was restarted 2026-09-12 06:42:42 with no
+  reboot (the box has been up since 2026-09-03) and no GPU reset, so it holds no
+  gpuHandle table. An NVLink-SHARP multicast team setup then arrives with
+  gpuHandle 0x0 and fails, and the DRIVER blocks on a response that never comes.
+  (A plain NCCL busy-wait would burn USER time; system-time-only is what tells
+  you it is in-kernel.)
+  Proof - /var/log/fabricmanager.log lines 16038-16046, 17 s after the last
+  training log line:
+     "Multicast Team Setup request received ... totalNumGpuHandles 0x4"
+     "[ERROR] cannot find exporter GPU in partition Id 57082 gpuHandle 0x0 ..."
+     "[ERROR] failed to add multicast team ... in partition 57082"
+  The first NCCL collective in the program is the barrier at
+  starVLA/dataloader/gr00t_lerobot/datasets.py:911 - exactly where it stops.
+  Diagnose:  grep "cannot find exporter GPU" /var/log/fabricmanager.log | tail
+  Do NOT reach for NCCL_IB_DISABLE: the ib_uverbs threads are present in HEALTHY
+  runs too and are a red herring. py-spy cannot attach either (ptrace_scope = 1);
+  use per-rank /proc/<pid>/stat utime-vs-stime deltas.
+  NOT a standing property of the node: 37 multicast setups succeeded 2026-09-05
+  to 09-11, including a 3-GPU team on {4,6,7}. The wedge began at the FM restart.
+  Hardened 2026-09-13: `export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"` now
+  lives in run_starvla_QwenOFT_pipette_train.sh, so forgetting the wrapper cannot
+  reintroduce it. (The launcher copy ARCHIVED in this run's dir predates that
+  edit; the run still had the export from the wrapper env.)
+  Real repair, needs admin: reset all 8 GPUs in fabric partition 57082. Also
+  documented as TRAP 12 in deployment/cluster/bootstrap_node.sh:355-371.
+  Evidence kept at
+  /data/jren313/starvla_outputs/oft_ee_abs_nostate.log.wedged_nonvls
+
+TRAP 2 - a non-interactive ssh shell is dash.
+  `ssh node "... accelerate launch ..."` fails with "accelerate: command not
+  found" (no conda on PATH), and `source ~/miniconda3/bin/activate` fails with
+  "source: not found" (dash has no such builtin). Prepend the env's bin directory
+  to PATH inside a script instead. Both mistakes were made on 2026-09-13 before
+  this run started. Related: never `pgrep -f` / `pkill -f` a pattern that appears
+  in your own ssh command line - it matches the invoking shell.
+
+TRAP 3 - node 2's home filesystem is 99% full.
+  Run dirs MUST be symlinks into /data/jren313/starvla_outputs, created BEFORE
+  launch. TMPDIR / TRITON_CACHE_DIR / TORCHINDUCTOR_CACHE_DIR must also be on
+  /data.
+
+TRAP 4 - base_vlm is a NODE path; it breaks local serving.
+  Checkpoints pulled back to the workstation carry
+  `framework.qwenvl.base_vlm: /data/jren313/models/Qwen3-VL-4B-Instruct` in both
+  config.yaml and config.full.yaml. Locally that directory does not exist, so
+  transformers treats it as a Hub repo id and raises HFValidationError. Rewrite
+  it to `Qwen/Qwen3-VL-4B-Instruct` in BOTH files (the local HF cache holds the
+  full snapshot; verified resolvable with HF_HUB_OFFLINE=1). Safe, because the
+  base only supplies architecture and tokenizer/processor - the run's own
+  pytorch_model.pt overwrites every weight.
+
+TRAP 5 - config.yaml in the run dir is an ACCESSED-ONLY snapshot.
+  It records just the fields that had been READ when it was written, so it is
+  missing include_state, state_dim, obs_image_size, eval_baseline, save_interval
+  and others. **config.full.yaml is the authoritative resolved config.** Always
+  verify a run against that one.
+
+TRAP 6 - the yaml is not authoritative for launcher-exported knobs.
+  This run's yaml says `num_workers: 4`; the resolved config says 12, because
+  NUM_WORKERS=12 in the wrapper reaches the CLI. That is the ONLY differing leaf
+  key (55 of 56 are byte-identical), but the principle applies to every knob the
+  launcher passes on the command line.
+
+TRAP 7 - do not put an A/B arm on GPU 0 of this node.
+  Round 2's state arm ran at ~1.49 s/it to step 4500, then collapsed to
+  4.6-4.9 s/it from roughly step 4700 to 8700 while another user's 66 GB job
+  shared GPU 0, recovered by step 9000, and finished at ~1.42 s/it. Cost: about 4
+  hours, and a wall-clock comparison between the two arms that means nothing
+  (13 h 38 m vs 8 h 18 m for identical work). The slowdown was GPU-side -
+  per-rank model time rose from ~0.6 s to 1.8-2.0 s while data time stayed at
+  0.001 s.
+
+--------------------------------------------------------------------------------
+11. RESULTS
+--------------------------------------------------------------------------------
+ROUND 3 SO FAR (baseline constant at mse_zero_action 8.698e-04):
+
+  step   action_dit_loss   mse_holdout   mse_ratio   rmse x/y/z (mm)
+  0      0.7069            0.658983      757.63      67.147 / 48.649 / 18.172
+  500    0.1839            0.076232       87.64      19.295 / 17.495 /  9.527
+  1000   0.0960            0.016654       19.15       6.700 /  7.438 /  6.081
+  (baseline, all steps)                               1.879 /  1.168 /  1.340
+
+  48 eval points are expected over the run (96 records, given the double fire).
+  ~1.23 s/it, ETA ~7 h 45 m from step 1419.
+
+  The ratio must cross 1.0 - i.e. per-dim RMSE must get under about
+  1.9 / 1.2 / 1.3 mm - for the policy to be worth serving.
+
+ROUND 2, FINAL (per-step DELTA space, eval_baseline = zero):
+
+                     mse_holdout   mse_ratio    rmse mm/step  x  /  y  /  z
+   no-state           0.080716      0.746866                0.11827/0.08631/0.08466
+   with-state         0.087329      0.808055                0.12854/0.08837/0.08709
+   hold-still base    0.108074      1.0                     0.14144/0.09174/0.10049
+
+   3D RMS (derived): nostate 0.09765, state 0.10315, baseline 0.11332 mm/step
+   -> the no-state arm cut 3D RMS by 13.8%, the with-state arm by only 9.0%.
+
+   mse_ratio trajectory, no-state:
+     step 0   4.281 | 500 1.130 | 1000 0.8896 | 2500 0.7987 | 5000 0.7838
+     | 9000 0.7499 | 15000 0.7470 | 17000 0.7417 (best) | 24000 0.7469
+     Crosses 1.0 between steps 500 and 1000; effectively flat (0.745-0.755) from
+     ~step 8000. The last 16,000 steps bought about 0.005 of ratio.
+
+   mse_ratio trajectory, with-state:
+     step 0   5.252 | 500 1.300 | 1000 0.9576 | 2500 0.8055 | 5000 0.7601
+     | 11500 0.7541 (best) | 15000 0.7926 | 20000 0.7993 | 24000 0.8081
+     *** IT BOTTOMS OUT AT STEP ~11,500 AND THEN DEGRADES MONOTONICALLY - a
+     textbook overfit to the proprioception tokens. Its best-ever ratio is still
+     worse than the no-state arm's best, and its best weights never existed on
+     disk (save_interval 5000 put the nearest at steps_10000 / steps_15000). ***
+     As of 2026-09-13 BOTH round-2 arms' intermediate checkpoints (8 files,
+     68 GB) have been DELETED on operator authorisation to make room for the
+     round-3/4 runs; /data had fallen to 102 GB free. Only final_model survives
+     for each arm, on the node and as md5-verified local copies (state
+     acddc38cadddce1abe48c03024adfd8a, nostate 92889dc431225246007cd967c21fc617,
+     9,138,385,915 bytes each). The delta action space is abandoned anyway, so
+     nothing recoverable was lost - but the state arm's near-peak weights are
+     now gone for good.
+
+   Wall clock: no-state 8 h 18 m (1.24 s/step, steady); with-state 13 h 38 m
+   (2.04 s/step average, inflated by TRAP 7). No crashes, OOMs, NaNs or restarts
+   in either arm.
+
+TWO CAVEATS WHEN COMPARING ROUNDS
+  * mse_ratio is NOT comparable across rounds - round 2 divided by a physical-
+    zero baseline, round 3 divides by hold_first. Compare the physical per-dim
+    RMSE, and remember the two rounds' RMSE mean different things anyway (mm per
+    60 Hz STEP for a delta head vs mm of absolute POSITION error per row).
+  * The holdout is only 256 samples. The 0.745-0.755 wobble round 2 showed on its
+    plateau is consistent with that sample size; do not over-read small
+    differences.
+
+--------------------------------------------------------------------------------
+12. SERVING CONTRACT  (NOT YET BUILT for the absolute head)
+--------------------------------------------------------------------------------
+What the round-2 DELTA path does today (VLAPolicyBridge, branch dev/per-phase -
+note the ENTIRE EE serving path is still UNCOMMITTED):
+
+   server returns  right_ee_dxyz (30, 3) metres per step. The wire key is the
+                   DataConfig action key with the "action." prefix stripped, so
+                   round 3 will emit `right_ee_xyz` with ZERO server edits - the
+                   server resolves the DataConfig from the checkpoint's data_mix
+                   through DATASET_NAMED_MIXTURES -> ROBOT_TYPE_CONFIG_MAP.
+   vla_policy_bridge/ee_delta.py (128 lines, class EEDeltaArm):
+                   integrates from the LAST COMMANDED pose (never the measured
+                   one - 20 mm of droop would be re-applied every chunk), caps
+                   each step at STEP_CAP_M = 5 mm, and solves
+                   solve_fixed_orientation(max_iterations=8,
+                   position_tolerance_m=2e-5, rotation_tolerance_rad=5e-4),
+                   seeded from the previous row's solution. Those tolerances are
+                   deliberately tighter than the solver defaults (8e-4 m would be
+                   a 0.8 mm DEADBAND at a 0.1 mm signal). An unconverged row
+                   keeps the best-effort joint-limit-clipped solution and is
+                   counted, never raised.
+   bridge hooks    bridge.py:1232-1235 in _produce_chunk (after the NaN/Inf chunk
+                   gate, before adapter.normalize_chunk, the nav clamp, the arm
+                   gain, diagnostics and the catch-up clamp);
+                   _ee_delta_to_arm / _ee_kinematics; the synthetic right_ee_xyz
+                   state key in _build_obs; and _executed_action_keys, which
+                   rewrites the wire key to `right_arm` for the publish tick and
+                   _first_step_targets.
+
+WHAT CHANGES FOR ABSOLUTE ROWS:
+   - NO integration and no last-command bookkeeping on the ACTION path: each row
+     IS the IK target. This deletes the most delicate part of the delta path, and
+     the converter gets strictly smaller.
+     (The waist half of the q_base overlay is still needed as IK CONTEXT, because
+     the chain runs pelvis -> waist(3) -> right arm.)
+   - TWO caps are needed, and one of them is new:
+       * per-step: clamp the displacement between consecutive rows (keep 5 mm).
+       * FIRST-ROW JUMP: clamp the distance from the last commanded pose to row 0.
+         In the delta space this was structurally impossible; with absolute
+         targets a mis-normalised or out-of-distribution chunk can ask for a large
+         teleport on the very first row. THIS IS THE MAIN NEW SAFETY ITEM.
+   - _executed_action_keys needs the same `right_ee_xyz -> right_arm` rename -
+     one extra branch in the same function. (Its docstring names the bug it
+     fixes: without it the publish tick KeyErrors on every tick, because the wire
+     key does not exist in a processed chunk.)
+   - Orientation is still HELD - this head is translation-only by construction.
+   - Downstream joint-space envelopes (max_arm_delta, catch-up clamp, URDF limit
+     clipping) are unchanged, so the safety story does not regress.
+   - Keep using _q29_of, never q[:29]: the inspire adapter's 41-dim q interleaves
+     left_hand at 22:28, so a flat slice feeds hand REGISTERS to the FK as arm
+     radians.
+
+CONFIG WORK FOR AN ABSOLUTE LANE:
+   - A profile twin of config/profiles/starvla_oft_pipette_ee_nostate_inspire.json
+     with required_action_keys carrying right_ee_xyz. NOTE the existing profile's
+     prose says "the BRIDGE integrates from the last commanded pose" - that is
+     the round-2 contract and is WRONG for round 3. The VIEW half carries over
+     verbatim.
+   - CONSIDER DROPPING right_ee_xyz FROM THE PROFILE'S state_keys. send_state
+     false stops only the SERVER from reading state; the BRIDGE still builds
+     every profile state_key, so it would pay an FK per frame and HARD-FAIL
+     (KeyError) if the vendored URDF were missing - for a value nothing reads.
+   - A lane twin of config/lanes/pipette_ee_nostate_starvla.json, a row in
+     config/index.json, entries in BOTH gui/server.py lane->ckpt maps, a new
+     *_CKPT default path and a help string.
+   - Golden tests: tests/test_config_lanes.py asserts 139 resolved bridge cells;
+     one more lane (openloop + closedloop) makes it 141 and regenerates
+     resolved_lanes_golden.txt and console_commands_golden.txt.
+   - The server COMMAND LINE is byte-identical for delta and absolute - the
+     action space lives in the profile and the bridge, not in any argv.
+
+SERVER-SIDE VIEW CONTRACT: UNCHANGED (section 5). Pipette3ViewOFTEEAbsDataConfig
+inherits serve_view_preprocess verbatim.
+
+--------------------------------------------------------------------------------
+13. FILE MANIFEST
+--------------------------------------------------------------------------------
+starVLA (this repo)
+  examples/realRobots/UnitreeG1_Pipette/train_files/
+      starvla_qwenoft_pipette_3view_hil293_ee_abs_nostate.yaml  the config
+      run_starvla_QwenOFT_pipette_train.sh                      the launcher
+      data_registry/data_config.py                              Pipette3ViewOFTEEAbsDataConfig
+      QWENOFT_ROUND3_EE_ABS_TRAINING_RECIPE.txt                 this file
+  starVLA/training/train_starvla.py            holdout eval + eval_baseline
+  starVLA/dataloader/gr00t_lerobot/datasets.py the barrier at :911 (TRAP 1)
+  starVLA/model/framework/VLM4A/QwenOFT.py     the framework
+  starVLA/model/modules/action_model/MLP_ActionHeader.py   the L1 head
+  deployment/model_server/policy_norm_processor.py  data_config property
+  deployment/model_server/gr00t_obs_adapter.py      calls serve_view_preprocess
+
+node 2
+  ~/launch_ee_abs.sh                                        the wrapper
+  /data/jren313/starvla_outputs/oft_ee_abs_nostate.log      live log
+  /data/jren313/starvla_outputs/oft_ee_abs_nostate.log.wedged_nonvls  TRAP 1
+  ~/Projects/starVLA/outputs/starvla/<run_id>/   (symlink into /data)
+      config.full.yaml            AUTHORITATIVE resolved config
+      config.yaml                 accessed-only snapshot (TRAP 5)
+      dataset_statistics.json     needed at serve time
+      checkpoints/steps_{5000,10000,15000,20000}_pytorch_model.pt
+      final_model/pytorch_model.pt
+  /data/jren313/starvla_outputs/oft_ee_{state,nostate}.log   round-2 logs
+
+datasets
+  ~/Datasets/g1-pipette-3view-hil293-ee{,-train,-eval}/
+      meta/splits.json  meta/modality.json  meta/stats_gr00t.json
+      meta/source_notes.json
+      meta/start_pose_ep000002.json     bridge episode staging (eval episode 2)
+
+*** VERSION CONTROL: none of this round is committed. Node 2's repo is at HEAD
+5a342d3 with 8 tracked files locally modified; the workstation is at 57f8e29. The
+six load-bearing source files are byte-identical between the two machines (so
+every code fact here applies to the live run), but the round-3 yaml, the launcher
+and the DataConfig changes are untracked or uncommitted on both. Commit them
+before the next round. ***
+
+--------------------------------------------------------------------------------
+14. WHAT TO DO WHEN IT FINISHES
+--------------------------------------------------------------------------------
+1. Read eval/mse_ratio, and read the per-dim RMSE in millimetres next to the
+   1.879 / 1.168 / 1.340 mm baseline. Below 1 means it beats freezing the hand.
+2. Check WHERE the best ratio was. Round 2's with-state arm peaked at step ~11500
+   and then degraded for 12,000 more steps; if round 3 does the same, the useful
+   checkpoint is one of steps_5000..20000, not final_model.
+3. Pull final_model/pytorch_model.pt plus config.yaml, config.full.yaml and
+   dataset_statistics.json to the workstation, then apply TRAP 4's base_vlm
+   rewrite.
+4. Build the absolute serving path and its profile/lane twin (section 12). The
+   new safety item is the first-row jump cap.
+5. Bench order: openloop on the HOLDOUT split first - it replays the 44 episodes
+   the checkpoint never trained on, a genuine out-of-sample gate - then
+   closedloop. Stage the episode with --start_pose_file so the run begins at a
+   real dataset initial condition.
+6. The question this round exists to answer: at the hover-above-tip scene, does
+   the arm keep descending? Watch the flight log's zero-chunk fraction, which is
+   what caught the round-2 collapse.
+================================================================================

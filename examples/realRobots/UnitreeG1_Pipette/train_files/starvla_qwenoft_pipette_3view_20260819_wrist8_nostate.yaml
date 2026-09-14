@@ -1,0 +1,139 @@
+# QwenOFT ROUND 4, "6-D WRIST POSE + 2-D THUMB, NO STATE" (2026-09-13).
+#
+# Same recipe as round 3 (starvla_qwenoft_pipette_3view_hil293_ee_abs_nostate)
+# on a DIFFERENT dataset with a RICHER action space. Operator's brief: train on
+# HF jren313/g1-pipette-3view-20260819, action = 6-D absolute right-wrist
+# pos/ori plus 2-D absolute right-hand thumb, no state observation, everything
+# else identical to the round currently running. Runs on GPUs 0-3, port 29924.
+#
+# WHAT CHANGED vs round 3
+#   * action    3 dims (absolute right-hand xyz) -> 8 dims:
+#                 action.right_wrist_pose6  [x,y,z, rx,ry,rz]  FK(action[:29]),
+#                   link right_rubber_hand, pelvis frame, metres + axis-angle
+#                 action.right_thumb        [thumb_bend, thumb_rot], a modality
+#                   SLICE of action.hand_right[4:6], raw Inspire registers 0..1000
+#               Round 3 could not rotate the wrist (position-only head) and never
+#               commanded the hand at all. This one does both.
+#   * data      g1-pipette-3view-20260819-wrist8-{train,eval}: 45 / 8 episodes,
+#               59,273 / 9,875 frames, same seed-1234 15% episode holdout.
+#               Built from the HF CANONICAL parquet (sha 3f63167...), not the
+#               local mirror, which carries extra locally-added phase columns.
+#               The task here is LONGER than hil293's - it also ejects the used
+#               tip into the disposal box - so the y span is 304 mm vs 156 mm.
+#   * state     the declared (unused) block is 35 dims here, not 32, because
+#               right_wrist_pose6 is 6 wide. include_state stays false.
+#
+# EVERYTHING ELSE IS BYTE-FOR-BYTE THE ROUND-3 RECIPE: three 256 views with 95%
+# random crop + 5 deg rotation + ColorJitter 0.3/0.4/0.5/0.08 + colour
+# temperature 0.15, horizon 30 at 60 Hz, per_device 16 x accum 2 x 4 GPUs = 128,
+# 24000 steps, warmup 600, the same three learning rates and cosine schedule,
+# holdout eval every 500 steps with eval_baseline hold_first.
+#
+# STEP BUDGET: 20 EPOCHS, not round 3's 10 (operator's call, 2026-09-13).
+#   59,273 train frames / 128 global batch = 463.07 steps per epoch
+#   9,300 steps x 128 = 1,190,400 samples = 20.08 epochs
+# The first launch of this run used round 3's literal 24,000 steps, which on a
+# dataset 5.2x smaller is 51.8 epochs; it was stopped at step 128 and relaunched
+# so the cosine schedule is rebuilt over 9,300 (the same relaunch-don't-truncate
+# discipline used when round 2 was cut from 60,000 to 24,000).
+# num_warmup_steps stays 600 as in every earlier round - warmup is an absolute
+# number of steps for the optimiser moments to settle, not a fraction of the run.
+#
+# save_interval is 2000 here, NOT round 3's 5000: at 9,300 total steps a 5,000
+# interval would put exactly ONE checkpoint on disk. Round 2's with-state arm
+# peaked at step ~11,500 and its best weights were never saved; 2000 gives four
+# capture points (2000/4000/6000/8000 plus final_model) so an early peak is
+# recoverable. This changes nothing about training dynamics.
+# It was briefly set to 1500 (six points) and widened the same day: /data fell
+# from 191 GB to 129 GB free while other users were writing, and the two live
+# runs still had ~100 GB of checkpoints to write between them.
+#
+# EXPECT AN EARLY PEAK ANYWAY. Round 2's with-state arm turned over at ~4.8
+# epochs; the holdout curve every 500 steps is the authority on which checkpoint
+# to keep, not the final one.
+#
+# eval_baseline hold_first is correct here for the same reason as round 3: the
+# action is ABSOLUTE, so a physical-zero baseline would be the pelvis origin
+# (and, for the thumb channels, register 0 = fully open) rather than "hold
+# still". hold_first repeats each sample's own first row.
+#
+run_id: starvla_qwenoft_pipette_3view_20260819_wrist8_nostate
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: jren313-georgia-institute-of-technology
+wandb_project: starVLA_unitree_g1_pipette
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenOFT
+  qwenvl:
+    base_vlm: /data/jren313/models/Qwen3-VL-4B-Instruct
+    attn_implementation: sdpa
+    enable_gradient_checkpointing: true
+  action_model:
+    action_model_type: MLP
+    # == Pipette3ViewOFTWrist8DataConfig.action_key_dims summed:
+    #    right_wrist_pose6 (6) + right_thumb (2) = 8
+    action_dim: 8
+    # No state in this arm (paired with include_state false below).
+    state_dim: 0
+    action_horizon: 30
+    action_hidden_dim: 2560
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    # Proprioception OFF, as round 3.
+    include_state: false
+    data_root_dir: /home/jren313/Datasets
+    data_mix: unitree_g1_pipette_3view_oft_wrist8_train_mix
+    # Held-out episodes, scored on fixed samples every eval_interval.
+    eval_data_mix: unitree_g1_pipette_3view_oft_wrist8_eval_mix
+    eval_num_batches: 4
+    # Hold-still baseline for an ABSOLUTE action space: repeat each sample's
+    # first target row (the default "zero" is only meaningful for delta spaces).
+    eval_baseline: hold_first
+    expected_num_views: 3
+    lerobot_version: v2.0
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    # post-crop size of every view (resize 270 -> crop 256 in the DataConfig)
+    obs_image_size: [256, 256]
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 4
+
+trainer:
+  # 20.08 epochs over 59,273 frames at global batch 128 (see the header).
+  max_train_steps: 9300
+  num_warmup_steps: 600
+  # 2000: 4 capture points (2000/4000/6000/8000) + final_model. Was 1500, widened
+  # 2026-09-13 because /data fell to 129 GB free while other users were writing.
+  save_interval: 2000
+  eval_interval: 500
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt

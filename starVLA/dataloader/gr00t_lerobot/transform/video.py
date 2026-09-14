@@ -304,6 +304,57 @@ class VideoCrop(VideoTransform):
             ), f"Video {key} has invalid shape {height, width}, expected {self.height, self.width}"
 
 
+class VideoCenterCrop(VideoTransform):
+    """A CENTRE crop of a fixed pixel size, in BOTH train and eval mode.
+
+    NOT VideoCrop. That one returns ``T.RandomCrop`` for mode="train" and
+    ``T.CenterCrop`` for mode="eval", which is the right default for an
+    augmentation but the wrong one here: the pipette rig's side cameras are
+    FIXED beside the rack, and the deployment path crops them deterministically
+    (VLAPolicyBridge ``view_crop``). A random train-time crop would teach the
+    model a framing distribution the server never reproduces.
+
+    Takes ``size`` in PIXELS rather than VideoCrop's ``scale`` fraction. The
+    scale spelling routes through ``int(height * scale)`` and 448/1080 is not
+    exactly representable, so a float that "should" give 448 can land on 447
+    and silently shift every downstream size by a pixel.
+
+    Ordering: this must run AFTER VideoToTensor (whose check_input asserts the
+    incoming resolution still equals the dataset metadata's) and BEFORE any
+    VideoResize.
+    """
+
+    size: int = Field(..., description="Side length in pixels of the centred crop")
+
+    def get_transform(self, mode: Literal["train", "eval"] = "train") -> Callable:
+        # Guard the views THIS crop applies to, not every view the metadata
+        # names: a 720 rgb crop must not be refused because some other view
+        # is stored smaller than 720.
+        for key, (w, h) in self.original_resolutions.items():
+            if key not in self.apply_to:
+                continue
+            if min(w, h) < self.size:
+                raise ValueError(
+                    f"VideoCenterCrop size {self.size} exceeds {key}'s stored "
+                    f"resolution {w}x{h}; a crop cannot invent pixels")
+        if self.backend == "torchvision":
+            return T.CenterCrop((self.size, self.size))
+        elif self.backend == "albumentations":
+            return A.CenterCrop(height=self.size, width=self.size, p=1)
+        raise ValueError(f"Backend {self.backend} not supported")
+
+    def check_input(self, data: dict[str, Any]):
+        super().check_input(data)
+        for key in self.apply_to:
+            if self.backend == "torchvision":
+                height, width = data[key].shape[-2:]
+            else:
+                height, width = data[key].shape[-3:-1]
+            assert height >= self.size and width >= self.size, (
+                f"Video {key} is {height}x{width}, smaller than the requested "
+                f"centre crop {self.size}x{self.size}")
+
+
 class VideoResize(VideoTransform):
     height: int = Field(..., description="The height of the resize")
     width: int = Field(..., description="The width of the resize")

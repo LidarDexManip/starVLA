@@ -1,0 +1,213 @@
+# ROUND 5 = round 4 (SPLIT + WAIST + STATE HISTORY, 27-dim) + PHASE LANGUAGE.
+#
+# EXACTLY ONE THING CHANGES from round 4: the language key. Rounds 1-4 serve
+# the SAME sentence on every tick of every episode, so the language block --
+# which is in every forward pass anyway -- carries no information about where
+# in the task the robot is. This run points it at
+# `annotation.human.phase`, a per-frame column, and the head sees one of three
+# sentences instead of one of one:
+#
+#   P1  Move the pipette left until it is above the tip rack.            13.7%
+#   P2  Aim at the red tip in the rack and lower the pipette onto it.    43.3%
+#   P3  The tip is attached. Lift the pipette clear of the rack, carry   43.0%
+#       it to the clear box on the right, and press the ejector.
+#
+# Model config, action space, state history, dropout, LR, batch and schedule
+# are all IDENTICAL to round 4.
+#
+# THE DATA IS NOT. Round 4 trained on the 49-episode 2026-08-13 split; this
+# trains on 62 = that split PLUS the 13-episode 2026-08-17 capture. So round 5
+# vs round 4 is TWO changes, not one, and a metric difference between them
+# cannot be attributed to the language channel alone. The added capture is
+# also the one with the INVERTED EJECTOR convention (see below), which makes
+# action.hand_right[5] bimodal here and not in round 4 -- expect that to cost
+# some action MSE on its own.
+#
+# For a clean single-variable A/B, train this yaml against
+# unitree_g1_pipette_tipcrop_train_waist_hist_n1d7's 49 episodes re-exported
+# with phase labels, or re-run round 4 on the 62.
+#
+# WHY THIS AND NOT MORE HISTORY. Round 4 attacked the aliasing with velocity:
+# descending onto the tip and rising off it are the same picture at nearly the
+# same joint configuration, and only the direction of travel separates them.
+# Language attacks the same ambiguity from the other side, and far more
+# cheaply -- P2 and P3 are different strings, so the two halves of the aliased
+# pair are no longer the same input at all. The two are complementary, which is
+# why history stays on here rather than being traded away.
+#
+# THREE PHASES, NOT FOUR. The original P3 (lift off the rack, median 0.95 s,
+# 6.4% of frames) merged into P4 on 2026-08-18. Its boundary was the only one
+# set by a tunable fraction of a continuous climb rather than by an extremum,
+# and sweeping that fraction moved the cut a median 0.26 s -- 27% of the phase
+# it bounded. Merging also removes a transition the serving-side phase machine
+# would have had to detect. Descending is still P2 and rising still P3, so the
+# aliased pair stays split.
+#
+# DATA. g1-pipette-tip-teleop-phase-train = splits.train + splits.new,
+# 62 episodes / 57,875 frames. Built with
+#   build_splits.py --src ~/Datasets/g1-pipette-tip-teleop-phase --from-splits
+# NOT re-randomised: the eval 10 are the same episodes round 4 held out, which
+# is the only way the two rounds can be compared on the same held-out set.
+#
+# SERVING. The phase sentence has to come from somewhere at deploy time, and
+# nothing writes it yet. The bridge re-reads --instruction_file on mtime
+# change (the piston lane's phase machine already uses this). After the merge
+# there are two boundaries to detect: `bottom` is tractable causally ("z rose
+# back above its running minimum"), `arrive` is the knob-set one that proved
+# unreliable offline on 3 of 4 reviewed episodes -- expect trouble there.
+# EVERY ROUND-4 DEPLOYMENT CONDITION STILL APPLIES (serve without --no_state,
+# run the robot at action_hz 60); they are restated in the round-4 yaml.
+#
+run_id: starvla_gr00t_n1d7_pipette_phase_hist_split
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: jren313-georgia-institute-of-technology
+wandb_project: starVLA_unitree_g1_pipette
+is_debug: false
+version_id: "0.1"
+
+framework:
+  name: CosmosGR00TN1d7
+  # N1.7 checkpoint dir (contains model-*.safetensors). Leave null to auto-find
+  # the snapshot in the HF cache (models--nvidia--GR00T-N1.7-3B).
+  pretrained_gr00t_n1d7: null
+  # 25 = unitree_g1_full_body_with_waist_height_nav_cmd. Our action layout is
+  # arms | right_hand | base_height | navigate(vx,vy,yaw_rate), which is the
+  # same category order, so this slot still warm-starts the projector rows.
+  embodiment_id: 25
+  tune_llm: true
+  tune_visual: true
+  enable_gradient_checkpointing: true
+  qwenvl:
+    base_vlm: nvidia/Cosmos-Reason2-2B
+    attn_implementation: sdpa
+    select_layer: 16
+  action_model:
+    # left_arm7 + right_arm7 + hand_right6 + root_height1 + lin_vel_xy2 +
+    # yaw_rate1 = 24 action dims; waist3 + left_arm7 + right_arm7 = 17 state.
+    # UNCHANGED from the single-view recipe: the tipcrop dataset's state/action
+    # parquets are byte-identical to the source, and its own meta/stats.json
+    # reproduces the same degenerate-dim census.
+    action_dim: 27
+    state_dim: 17
+    # 30, and NO LONGER == len(action_indices): round 4's DataConfig loads
+    # 30 + MAX_LAG actions so VisionLagJitter has something to slide over,
+    # then hands the head exactly 30 back. Changing MAX_LAG does not change
+    # this number.
+    action_horizon: 30
+    # --- everything below matches nvidia/GR00T-N1.7-3B config.json and MUST NOT
+    #     change if you want the pretrained head to keep loading 1:1 ---
+    max_action_dim: 132
+    max_state_dim: 132
+    # ROUND 4: four state frames, matching the DataConfig's
+    # state_indices [-36, -24, -12, 0] (0.6 s). This is the ONE architectural
+    # change, and the reason the pretrained state_encoder needs widening.
+    state_history_length: 4
+    max_num_embodiments: 32
+    backbone_embedding_dim: 2048
+    input_embedding_dim: 1536
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    use_vlln: true
+    use_alternate_vl_dit: true
+    attend_text_every_n_blocks: 2
+    num_inference_timesteps: 4
+    num_timestep_buckets: 1000
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    # 0.8 -> 0.3. The old value was chosen to FORCE camera reliance, and it
+    # succeeded: at 80% dropout the head spent most of training with no proprio
+    # at all, which is coherent with serving --no_state but leaves nothing to
+    # break the up/down tie. It cannot stay high here or the history is trained
+    # away. It should not go to 0.0 either: joint angles alone predict the next
+    # action well on a repetitive bench task, and a head that takes that
+    # shortcut stops looking at the rack. 0.3 keeps vision load-bearing while
+    # letting state be present on most steps.
+    state_dropout_prob: 0.3
+    # --- press-phase frame weighting (CosmosGR00T_N1d7._frame_weights) --------
+    # OFF, deliberately. This run changes the VISION path; leaving the loss
+    # identical to the single-view recipe is what makes the two comparable. If
+    # the baseline under-presses the ejector, turn it on THEN — dim 18 ==
+    # action.hand_right[4] == thumb_bend, and under min_max on 0..1000 a +0.04
+    # threshold (raw > 520) flags 1.68% of frames.
+    grasp_loss_weight: 1.0
+    grasp_weight_dim: 18
+    grasp_weight_thresh: 0.04
+    diffusion_model_cfg:
+      num_attention_heads: 32
+      attention_head_dim: 48
+      output_dim: 1024
+      num_layers: 32
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      positional_embeddings: null
+    vl_self_attention_cfg:
+      num_attention_heads: 32
+      attention_head_dim: 64
+      num_layers: 4
+      dropout: 0.2
+      final_dropout: true
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    # TRUE: N1.7 is flow-matching and conditions on proprio.
+    include_state: true
+    data_root_dir: /home/jren313/Datasets
+    data_mix: unitree_g1_pipette_phase_train_n1d7
+    # Serve-time camera-count contract == len(video_keys) of the DataConfig
+    # (rgb, tip_crop, IN THAT ORDER). The framework logs a loud error if an eval
+    # client sends a different count; without it the mismatch is silent.
+    # See CosmosGR00T_N1d7._check_num_views.
+    expected_num_views: 2
+    lerobot_version: v2.0             # v2.1 layout reads fine via the v2.0 path
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 16         # x8 GPUs x accum 1 = global batch 128
+    load_all_data_for_training: true
+    obs_image_size: [256, 256]        # N1.7 image_target_size
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 4
+
+trainer:
+  max_train_steps: 10000              # ~22.1 epochs over 57,875 frames @ batch 128
+  num_warmup_steps: 100
+  save_interval: 2000                 # 9.5 GB per checkpoint — 5 + final = ~57 GB
+  eval_interval: 500
+  learning_rate:
+    base: 2.0e-05
+    qwen_vl_interface: 2.0e-05
+    action_head: 2.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  # Informational only — real accum comes from ACCELERATE_GRADIENT_ACCUMULATION_STEPS
+  # exported by the launcher (Accelerator is built at import time). Keep in sync.
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+
+  optimizer:
+    # paged_adamw_8bit, as in the single-view recipe. The 8xB200 wristcam run
+    # used plain adamw; on a 180 GB card either fits, and 8-bit states are what
+    # make a local smoke test on a 16 GB card possible at all. Override with
+    # --trainer.optimizer.name adamw to match that run exactly.
+    name: paged_adamw_8bit
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  save_format: pt

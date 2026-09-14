@@ -120,7 +120,16 @@ if [[ -n "${PRETRAINED_CHECKPOINT}" ]]; then
   EXTRA_ARGS+=(--trainer.pretrained_checkpoint "${PRETRAINED_CHECKPOINT}")
 fi
 
+# Rendezvous port. The default 29500 is what EVERY accelerate/torchrun job
+# on a shared box also defaults to — a second user launching at the same
+# minute connects to OUR TCPStore and both jobs hang in silent store-wait
+# spins (observed 2026-09-02: bir's 10:33 launch froze our 10:23 run's four
+# ranks at "Using mixture" for 45 min, 100% system-CPU each). Pick any
+# uncontended port when sharing the node.
+MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-29500}"
+
 accelerate launch \
+  --main_process_port "${MAIN_PROCESS_PORT}" \
   --num_processes "${NUM_PROCESSES}" \
   "${MULTI_GPU_ARGS[@]}" \
   --mixed_precision no \

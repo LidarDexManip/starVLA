@@ -1,0 +1,195 @@
+# FT14 RERUN WITH THE REPLACEMENT HIL BLOCK (2026-09-10).
+#
+# Identical to plus21p12_hil46_ft14 in every training knob -- weights from
+# ROUND 14's served checkpoint (steps_15000, via PRETRAINED_CHECKPOINT;
+# is_resume false = fresh optimizer, step 0), 3000 steps at 1/5 the LR,
+# union q99 stats -- the SINGLE variable is the HIL data: the 46
+# 2026-09-04 correction episodes (dead hand-action channel, later
+# repaired-by-reconstruction) are replaced by 30 fresh joystick-HIL
+# episodes recorded 2026-09-10 with the adapter's hand-action mirror
+# live and wrist slots audited per episode. Operator's hypothesis: the
+# old HIL block, not the recipe, is what held the ft14 arm back.
+# Same merge script (build_merge_r15.py), same base 78 teleop episodes.
+#
+run_id: starvla_gr00t_n1d7_pipette_3view_nohist_plus21p12_hil30_ft14
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: jren313-georgia-institute-of-technology
+wandb_project: starVLA_unitree_g1_pipette
+is_debug: false
+version_id: "0.1"
+
+framework:
+  name: CosmosGR00TN1d7
+  # N1.7 checkpoint dir (contains model-*.safetensors). Leave null to auto-find
+  # the snapshot in the HF cache (models--nvidia--GR00T-N1.7-3B).
+  pretrained_gr00t_n1d7: null
+  # 25 = unitree_g1_full_body_with_waist_height_nav_cmd. Our action layout is
+  # arms | right_hand | base_height | navigate(vx,vy,yaw_rate), which is the
+  # same category order, so this slot still warm-starts the projector rows.
+  embodiment_id: 25
+  tune_llm: true
+  tune_visual: true
+  enable_gradient_checkpointing: true
+  qwenvl:
+    base_vlm: nvidia/Cosmos-Reason2-2B
+    attn_implementation: sdpa
+    select_layer: 16
+  action_model:
+    # left_arm7 + right_arm7 + hand_right6 + root_height1 + lin_vel_xy2 +
+    # yaw_rate1 = 24 action dims; waist3 + left_arm7 + right_arm7 = 17 state.
+    # UNCHANGED from the single-view recipe: the tipcrop dataset's state/action
+    # parquets are byte-identical to the source, and its own meta/stats.json
+    # reproduces the same degenerate-dim census.
+    action_dim: 27
+    state_dim: 17
+    # 30, and NO LONGER == len(action_indices): round 4's DataConfig loads
+    # 30 + MAX_LAG actions so VisionLagJitter has something to slide over,
+    # then hands the head exactly 30 back. Changing MAX_LAG does not change
+    # this number.
+    action_horizon: 30
+    # --- everything below matches nvidia/GR00T-N1.7-3B config.json and MUST NOT
+    #     change if you want the pretrained head to keep loading 1:1 ---
+    max_action_dim: 132
+    max_state_dim: 132
+    # ROUND 4: four state frames, matching the DataConfig's
+    # state_indices [-36, -24, -12, 0] (0.6 s). This is the ONE architectural
+    # change, and the reason the pretrained state_encoder needs widening.
+    # ROUND 11: ONE state frame, not 4. MUST match the DataConfig's
+    # state_indices [0]; a mismatch feeds the state_encoder 132*4 where
+    # 132 arrived and the shapes disagree loudly at the first step.
+    state_history_length: 1
+    max_num_embodiments: 32
+    backbone_embedding_dim: 2048
+    input_embedding_dim: 1536
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    use_vlln: true
+    use_alternate_vl_dit: true
+    attend_text_every_n_blocks: 2
+    num_inference_timesteps: 4
+    num_timestep_buckets: 1000
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    # 0.8 -> 0.3. The old value was chosen to FORCE camera reliance, and it
+    # succeeded: at 80% dropout the head spent most of training with no proprio
+    # at all, which is coherent with serving --no_state but leaves nothing to
+    # break the up/down tie. It cannot stay high here or the history is trained
+    # away. It should not go to 0.0 either: joint angles alone predict the next
+    # action well on a repetitive bench task, and a head that takes that
+    # shortcut stops looking at the rack. 0.3 keeps vision load-bearing while
+    # letting state be present on most steps.
+    # ROUND 11: 0.8, as round 8 used. With only one state frame there is
+    # no temporal redundancy left, so this is the strongest push toward
+    # solving the task from PIXELS rather than from proprioception.
+    state_dropout_prob: 0.8
+    # --- press-phase frame weighting (CosmosGR00T_N1d7._frame_weights) --------
+    # OFF, deliberately. This run changes the VISION path; leaving the loss
+    # identical to the single-view recipe is what makes the two comparable. If
+    # the baseline under-presses the ejector, turn it on THEN — dim 18 ==
+    # action.hand_right[4] == thumb_bend, and under min_max on 0..1000 a +0.04
+    # threshold (raw > 520) flags 1.68% of frames.
+    grasp_loss_weight: 1.0
+    grasp_weight_dim: 18
+    grasp_weight_thresh: 0.04
+    diffusion_model_cfg:
+      num_attention_heads: 32
+      attention_head_dim: 48
+      output_dim: 1024
+      num_layers: 32
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      positional_embeddings: null
+    vl_self_attention_cfg:
+      num_attention_heads: 32
+      attention_head_dim: 64
+      num_layers: 4
+      dropout: 0.2
+      final_dropout: true
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    # TRUE: N1.7 is flow-matching and conditions on proprio.
+    include_state: true
+    data_root_dir: /home/jren313/Datasets
+    # ROUND 7 AS RUN: the mixres recipe on the P1+P2 TRUNCATION. Each episode
+    # stops when phase 2 finishes -- the frame the tip seats in the well -- so
+    # the model learns approach + insertion and never sees the lift, carry or
+    # ejection. 37,943 of 69,148 frames (54.9%); median episode 11.4 s (was
+    # 19.4 s). Its own DIRECTORY, not a row filter: normalisation statistics
+    # are globbed off the parquet tree, and normalising against a distribution
+    # that still contains the carry and the ejector press would give the head
+    # a q99 for motions this round deliberately excludes.
+    data_mix: unitree_g1_pipette_3view_mixres_nohist_plus21p12_hil30_n1d7_mix
+    # Serve-time camera-count contract == len(video_keys) of the DataConfig
+    # (rgb, tip_crop, IN THAT ORDER). The framework logs a loud error if an eval
+    # client sends a different count; without it the mismatch is silent.
+    # See CosmosGR00T_N1d7._check_num_views.
+    expected_num_views: 3
+    lerobot_version: v2.0             # v2.1 layout reads fine via the v2.0 path
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    # 4 GPUs this round (0 and 1 carry another job), so 32 per device
+    # holds the global batch at 128 and keeps the LR schedule comparable
+    # to rounds 7-10. B200s have 183 GB; round 7 used 16 on the same
+    # token budget, so 32 has ample headroom.
+    per_device_batch_size: 32         # x4 GPUs x accum 1 = global batch 128
+    load_all_data_for_training: true
+    # PER-VIEW sizes, in the DataConfig's video_keys order
+    # (rgb, wrist_left, wrist_right). Read by BOTH the loader's _pack_sample
+    # and the server's predict_action; they must agree or the head is served
+    # views at a scale it never trained on. Must also match
+    # Pipette3ViewMixResG1GR00TN1d7DataConfig.view_resize_overrides.
+    obs_image_size: [[256, 256], [448, 448], [448, 448]]
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 4
+
+trainer:
+  # 10000 steps is ~33.7 epochs over the 37,943 truncated frames @ batch 128,
+  # against 18.5 over the full capture -- the step count is held constant so
+  # this run stays comparable with round 6 on the axis that changed (views and
+  # segment), not on schedule length. Watch the eval curve: at nearly twice
+  # the epochs, overfitting shows up earlier than it did in round 6.
+  max_train_steps: 3000
+  num_warmup_steps: 50
+  save_interval: 500                  # short run: 6 saves + final on /data
+  eval_interval: 500
+  learning_rate:
+    # 1/5 of the from-scratch recipe: fine-tuning from R14, not training
+    base: 4.0e-06
+    qwen_vl_interface: 4.0e-06
+    action_head: 4.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  # Informational only — real accum comes from ACCELERATE_GRADIENT_ACCUMULATION_STEPS
+  # exported by the launcher (Accelerator is built at import time). Keep in sync.
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+
+  optimizer:
+    # paged_adamw_8bit, as in the single-view recipe. The 8xB200 wristcam run
+    # used plain adamw; on a 180 GB card either fits, and 8-bit states are what
+    # make a local smoke test on a 16 GB card possible at all. Override with
+    # --trainer.optimizer.name adamw to match that run exactly.
+    name: paged_adamw_8bit
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  save_format: pt

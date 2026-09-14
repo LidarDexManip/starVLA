@@ -1,0 +1,115 @@
+# QwenOFT FROM SCRATCH on the full HIL union -- the first non-GR00T head on
+# the pipette task (2026-09-11).
+#
+# Recipe = the multitask QwenOFT reference (coffee_mg_oft_alltask_20260906_v1):
+# the same Qwen3-VL-4B-Instruct backbone, the same MLP L1 head over the
+# "🔍" action tokens, no proprioception, the same per-module LRs
+# (2.5e-5 / 1e-5 / 1e-4), cosine to 1e-6, AdamW(0.9, 0.95), 1% warmup, full
+# fine-tune with gradient checkpointing, plain accelerate (no DeepSpeed).
+#
+# What changes is the DATA CONTRACT, not the recipe:
+#   * the head is 27-wide (arms 7+7 | right hand 6 | root height 1 |
+#     lin vel 2 | yaw rate 1 | waist 3) instead of the reference's 19 --
+#     the bridge profile's action split, byte-for-byte the N1.7 rounds';
+#   * the horizon is 30, the bridge's chunk contract (reference: 16);
+#   * the three views keep the pipette rounds' mixres sizes (ego 256,
+#     wrists 448) rather than 224: the tip is a few pixels wide in a 224
+#     wrist frame (measured in round 7), and Qwen3-VL tokenises resolution
+#     dynamically, so 448 costs tokens, not correctness.
+#
+# The head starts from random init (no pretrained OFT head exists); the
+# backbone is the stock Instruct model. 60000 steps at batch 128 = 21.2
+# epochs over 363,006 frames (operator asked for >= 20). Saves every 5000
+# so a checkpoint is picked off the eval curve after the fact; the cosine
+# schedule stretches to 60000, so an intermediate save sits at a higher
+# LR than a shorter run's endpoint would.
+#
+# Proprioception stays OFF (include_state false): with it on, the OFT
+# prompt is suffixed with discretised state bins that nearly name the
+# answer (action[0:14] tracks the arm state) and the policy stops looking
+# at the cameras -- the closed-loop failure mode this head was ported to
+# avoid. The DataConfig keeps the state keys registered only so their q99
+# stats exist for the serving contract.
+#
+run_id: starvla_qwenoft_pipette_3view_hil293
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: jren313-georgia-institute-of-technology
+wandb_project: starVLA_unitree_g1_pipette
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenOFT
+  qwenvl:
+    # Local snapshot on node 2 (home is full; HF cache cannot take 8 GB).
+    # The launcher overrides this with BASE_VLM for a smoke elsewhere.
+    base_vlm: /data/jren313/models/Qwen3-VL-4B-Instruct
+    attn_implementation: sdpa
+    # Live grad-ckpt switch (trainer.gradient_checkpointing is dead config).
+    enable_gradient_checkpointing: true
+  action_model:
+    action_model_type: MLP
+    # == sum of Pipette3ViewOFTDataConfig.action_key_dims (27).
+    action_dim: 27
+    # Inert for the MLP head (no state input); kept 0 so the config
+    # validator pairs it with include_state false.
+    state_dim: 0
+    # == len(Pipette3ViewOFTDataConfig.action_indices) and the bridge's chunk.
+    action_horizon: 30
+    # Realigned to the backbone's hidden_size at runtime; 2560 is the 4B's.
+    action_hidden_dim: 2560
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    # OFF ON PURPOSE -- see the header.
+    include_state: false
+    data_root_dir: /home/jren313/Datasets
+    data_mix: unitree_g1_pipette_3view_oft_hil293_mix
+    expected_num_views: 3
+    lerobot_version: v2.0             # v2.1 layout reads fine via the v2.0 path
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 32         # x4 GPUs x accum 1 = global batch 128
+    load_all_data_for_training: true
+    # video_keys order: rgb, wrist_left, wrist_right -- MUST match the
+    # DataConfig's view_resize sizes (ego 256, wrists 448).
+    obs_image_size: [[256, 256], [448, 448], [448, 448]]
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 4
+
+trainer:
+  # 60000 steps at effective batch 128 = 21.2 epochs over 363,006 frames.
+  max_train_steps: 60000
+  num_warmup_steps: 600               # the recipe's 1% ratio
+  save_interval: 5000
+  eval_interval: 500
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  # FULL fine-tune: QwenOFT has no projector, the action token rides through
+  # the VLM, so a frozen backbone leaves nothing to adapt the visual features.
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  # Informational -- the real value is ACCELERATE_GRADIENT_ACCUMULATION_STEPS,
+  # exported by the launcher (the Accelerator is built at module import).
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt

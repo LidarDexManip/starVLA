@@ -1,0 +1,158 @@
+# QwenOFT ROUND 5, "MERGED DATA, 6-D WRIST POSE + 2-D THUMB, NO STATE"
+# (2026-09-13). Operator's brief: combine round 3's and round 4's data and keep
+# round 4's settings. GPUs 0-3, port 29925, launched only once GPUs 0-3 are free
+# of other users.
+#
+# THE TWO CAPTURES, POOLED
+#   g1-pipette-3view-hil293-wrist8-train      249 eps / 306,891 frames  (round 3)
+#   g1-pipette-3view-20260819-wrist8-train     45 eps /  59,273 frames  (round 4)
+#                                             ----------------------
+#                                             294 eps / 366,164 frames
+#   holdout  44 eps / 56,115 fr  +  8 eps / 9,875 fr  =  52 eps / 65,990 fr
+#
+# hil293 keeps EXACTLY the episodes round 3 held out (seed 1234, copied from the
+# -ee split, not redrawn), so the shared half of this run is directly comparable
+# to round 3.
+#
+# TWO THINGS HAD TO BE BUILT FOR THE POOL TO BE LEGITIMATE
+#   1. ONE SHARED q99 BOX. LeRobotSingleDataset caches q01/q99 by globbing the
+#      dir it is pointed at, so a two-dataset mixture would normalise each half
+#      with its own quantiles - and these two are far apart (right-hand xyz spans
+#      122/157/75 mm for hil293 vs 68/304/134 mm for 20260819; thumb_bend sits in
+#      a 217-wide band vs the full 0..1000). The same physical pose would then
+#      carry different labels in the two halves, and the policy server, which
+#      loads ONE statistics file, could not undo it. scratchpad
+#      union_stats_wrist8.py computes the statistics over the union of both TRAIN
+#      splits and writes a byte-identical meta/stats_gr00t.json into all four
+#      split dirs (md5 6fecb5cdc38400f0b7daea699acc9fac).
+#      Union q99 box: 114.6 / 278.7 / 92.2 mm, 0.216 / 0.229 / 1.079 rad,
+#      thumb 746.9 / 524.3 registers.
+#   2. FRAME-COUNT MIXTURE WEIGHTS. LeRobotMixtureDataset.sample_step draws the
+#      DATASET by the sampling weights (it does not concatenate), so the default
+#      1.0/1.0 would have oversampled the 45-episode capture about 6x. The
+#      mixture carries the train frame counts instead, giving 0.838 / 0.162 -
+#      the natural pooled distribution.
+#
+# KNOWN ASYMMETRY, STATED SO NOBODY IS SURPRISED BY THE THUMB METRICS
+#   hil293's right hand barely moves: thumb_bend lives in 509.8..726.7 and
+#   thumb_rot in 670.7..871.4, with only 331 distinct values across 363,006 rows
+#   - it is a grip held per episode. 20260819's thumb works the full register
+#   range (11,046 distinct values) because that capture also presses the ejector.
+#   So 84% of the pooled thumb supervision is a near-constant. That is not label
+#   noise - the two captures are different task variants and the language
+#   annotation differs ("...to the pipette." vs "...to the pipette, then eject
+#   the used tip into the tip disposal box."), so a conditional model can learn
+#   both modes - but the thumb head here will be weaker than round 4's.
+#   Sharper still (measured on hil293's train split): the thumb pair is EXACTLY
+#   constant for the whole episode in 241 of 249 episodes, and 43 of them - 13.9%
+#   of the pooled train frames - carry a thumb value that source_notes.json says
+#   was IMPUTED at the healthy median (0,0,0,0,639.3,777.3) after the recorder
+#   wrote a fully-open rail. That fraction of the thumb target is invented data.
+#   The four non-thumb fingers are identically 0 in BOTH captures.
+#
+# HOW TO READ eval/mse_ratio HERE - IT IS NOT WHAT THE SAMPLE COUNT SUGGESTS.
+#   The 256 fixed holdout samples split 205 hil293 / 51 20260819 (80.1% / 19.9%
+#   by count, simulated from sample_step with the eval weights). But mse_ratio is
+#   a ratio of SUMS, and the hold_first baseline ENERGY splits 12.1 (hil293) vs
+#   116.3 (20260819) = 9.4% / 90.6%: a per-sample difficulty ratio of 38.6x.
+#   hil293 repeats the previous commanded pose on 39.6% of its 60 Hz frames and
+#   its commanded wrist ORIENTATION is frozen within an episode (mean |delta|
+#   over the 30-step horizon: rx 2e-6, ry 9e-6, rz 3e-6 rad), so its rx/ry/rz and
+#   thumb contribute essentially nothing to the denominator.
+#   CONSEQUENCE: the pooled mse_ratio is effectively a 20260819-ONLY metric, and
+#   it is NOT comparable to round 3's or round 4's. The holdout is deterministic
+#   (mode="val", seed=index, transforms.eval()), so per-capture numbers can be
+#   reconstructed exactly from any saved checkpoint after the fact - do that
+#   before drawing conclusions about the hil293 half.
+#
+# STEP BUDGET: round 4's 20 epochs, recomputed for the bigger pool.
+#   366,164 train frames / 128 global batch = 2,860.7 steps per epoch
+#   57,200 steps x 128 = 7,321,600 samples = 20.0 epochs   (~20 h at 1.25 s/step)
+# HONEST EXPECTATION: both earlier runs flattened long before their budget ran
+# out - round 3 gained only ~16% of ratio over its last 5,000 steps, and round 4
+# peaked at 10.8 of its 20 epochs. The holdout curve every 500 steps is the
+# authority; stopping this early and keeping the best checkpoint is expected to
+# cost nothing.
+#
+# save_interval 12000 (checkpoints at 12000/24000/36000/48000 plus final_model,
+# 4 x 8.6 GB) is set by DISK, not by preference: node-2 /data was at 82 GB free
+# and falling while other users wrote. Tighten it if space is freed.
+#
+# Everything else is round 4 verbatim: 8-dim action, include_state false, three
+# 256 views with 95% crop + 5 deg rotation + ColorJitter 0.3/0.4/0.5/0.08 +
+# colour temperature 0.15, horizon 30 at 60 Hz, 16 x 2 x 4 GPUs = 128, warmup
+# 600, the same three learning rates and cosine schedule, eval every 500 with
+# eval_baseline hold_first.
+#
+run_id: starvla_qwenoft_pipette_3view_merged_wrist8_nostate
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: jren313-georgia-institute-of-technology
+wandb_project: starVLA_unitree_g1_pipette
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenOFT
+  qwenvl:
+    base_vlm: /data/jren313/models/Qwen3-VL-4B-Instruct
+    attn_implementation: sdpa
+    enable_gradient_checkpointing: true
+  action_model:
+    action_model_type: MLP
+    # right_wrist_pose6 (6) + right_thumb (2) = 8
+    action_dim: 8
+    state_dim: 0
+    action_horizon: 30
+    action_hidden_dim: 2560
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: false
+    data_root_dir: /home/jren313/Datasets
+    data_mix: unitree_g1_pipette_3view_oft_wrist8_merged_train_mix
+    eval_data_mix: unitree_g1_pipette_3view_oft_wrist8_merged_eval_mix
+    eval_num_batches: 4
+    eval_baseline: hold_first
+    expected_num_views: 3
+    lerobot_version: v2.0
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    obs_image_size: [256, 256]
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 4
+
+trainer:
+  # 20.0 epochs over 366,164 pooled frames at global batch 128.
+  max_train_steps: 57200
+  num_warmup_steps: 600
+  # Disk-limited; see the header.
+  save_interval: 12000
+  eval_interval: 500
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt

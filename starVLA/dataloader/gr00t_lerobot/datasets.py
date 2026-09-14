@@ -572,6 +572,42 @@ def _barrier():
         dist.barrier()
 
 
+def parse_obs_image_size(raw, n_views: int, default=(224, 224)):
+    """``obs_image_size`` -> ``[(h, w)] * n_views``, in video_keys order.
+
+    THE ONE PLACE THIS IS DECIDED. The field has two legal spellings — one
+    ``[h, w]`` for every view, or one ``[h, w]`` PER view — and three separate
+    consumers must agree about which they are looking at: the training loader
+    (_pack_sample), the policy server's resize (CosmosGR00T_N1d7
+    .predict_action) and the serving norm processor (policy_norm_processor).
+    Each grew its own copy of the test and each got it wrong the same way, so
+    the test lives here now and they import it.
+
+    NESTEDNESS IS DECIDED BY "the first element is not a number", never by
+    isinstance(list, tuple). The value arrives wrapped by whatever config layer
+    loaded it — omegaconf hands back a ListConfig, the trainer wraps that in an
+    AccessTrackedConfig — and neither is a list or a tuple. Asking about the
+    CONTAINER therefore reports a per-view config as flat, which is how
+    [[256,256],[448,448],[448,448]] produced "int() argument must be ... not
+    'AccessTrackedConfig'" in the loader, silently served three 256s in the
+    model server, and raised "not 'list'" in the norm processor. Asking about
+    the SCALAR is the question that has one answer through every wrapper.
+    """
+    def _scalar(v):
+        return isinstance(v, (int, float)) or (
+            isinstance(v, str) and v.isdigit())
+
+    if not raw:
+        return [tuple(default)] * n_views
+    if _scalar(raw[0]):
+        return [(int(raw[0]), int(raw[1]))] * n_views
+    if len(raw) != n_views:
+        raise ValueError(
+            f"obs_image_size lists {len(raw)} per-view sizes but there are "
+            f"{n_views} video keys")
+    return [(int(p[0]), int(p[1])) for p in raw]
+
+
 class ModalityConfig(BaseModel):
     """Configuration for a modality."""
 
@@ -622,6 +658,34 @@ class LeRobotSingleDataset(Dataset):
 
         self.delete_pause_frame = delete_pause_frame
 
+        # Round 6 (2026-09-13) PAUSE FILTER. Drop chunk ANCHORS whose in-chunk
+        # commanded-hand motion is under this many millimetres. 0 (the default)
+        # keeps every anchor and is bit-identical to the pre-filter loader, the
+        # steps-cache key included, so no existing run changes.
+        #
+        # Why it exists: a chunk-relative action label (a[t+i] - a[t]) is
+        # bit-exact zero on every row whenever the demonstrator held still, and
+        # conditioned on the arm ALREADY being stationary that is 48.11% of
+        # chunks in g1-pipette-3view-hil293-ee-train. QwenOFT trains with
+        # nn.L1Loss, whose optimum is the conditional MEDIAN, and a median sits
+        # exactly on zero as soon as the zero mass straddles the 50th
+        # percentile -- which is how round 2's delta head died (72.98% zero
+        # there). A 1.0 mm gate removes the mass outright and keeps
+        # 253,594 / 306,891 anchors (82.63%).
+        #
+        # Read off data_cfg directly, like lerobot_version above, so nothing in
+        # lerobot_datasets.py has to change AND _DataCfgOverride can still
+        # suppress it for the holdout (train_starvla.prepare_holdout_batches).
+        _pf_cfg = self.data_cfg
+        self.pause_filter_mm = float(
+            (_pf_cfg.get("pause_filter_mm", 0.0) or 0.0) if _pf_cfg is not None else 0.0
+        )
+        self.pause_filter_key = str(
+            _pf_cfg.get("pause_filter_key", "action.right_ee_xyz")
+            if _pf_cfg is not None
+            else "action.right_ee_xyz"
+        )
+
         self.modality_configs = modality_configs
         self.video_backend = video_backend
         self.video_backend_kwargs = video_backend_kwargs if video_backend_kwargs is not None else {}
@@ -654,6 +718,11 @@ class LeRobotSingleDataset(Dataset):
         self._modality_keys = self._get_modality_keys()
         self._delta_indices = self._get_delta_indices()
         self._all_steps = self._get_all_steps()
+        # The MIXTURE samples base_index from trajectory_lengths, not from
+        # all_steps (LeRobotMixtureDataset.sample_step), so filtering all_steps
+        # alone would change only len(dataset) and the logged epoch number.
+        # This table is what actually makes the pause filter reach the sampler.
+        self._anchors_by_trajectory = self._build_anchor_table(self._all_steps)
         self.set_transforms_metadata(self.metadata)
         self.set_epoch(0)
 
@@ -698,6 +767,24 @@ class LeRobotSingleDataset(Dataset):
             ]
         """
         return self._all_steps
+
+    def _build_anchor_table(self, all_steps) -> dict:
+        """{trajectory_id: int64 array of base indices that survived the filter}.
+
+        See the note at the call site: ``all_steps`` never reaches the sampler on
+        the mixture path, so the pause filter needs this table to have any effect
+        on what is trained.
+        """
+        by_traj: dict[int, list[int]] = defaultdict(list)
+        for trajectory_id, base_index in all_steps:
+            by_traj[int(trajectory_id)].append(int(base_index))
+        return {k: np.asarray(v, dtype=np.int64) for k, v in by_traj.items()}
+
+    def sampleable_base_indices(self, trajectory_id: int):
+        """Anchors the sampler may draw for this trajectory, or None for 'all'."""
+        if self.pause_filter_mm <= 0.0:
+            return None
+        return self._anchors_by_trajectory.get(int(trajectory_id))
 
     @property
     def modality_keys(self) -> dict:
@@ -1025,6 +1112,18 @@ class LeRobotSingleDataset(Dataset):
                 )
                 cached_data = None
 
+        # The config_key was COMPUTED and STORED but never COMPARED, which is why
+        # delete_pause_frame was a no-op that did not even bust the cache. Rank
+        # safety: invalidating here only sets cached_data=None; every rank still
+        # reaches the single unconditional barrier below and then re-reads the
+        # file rank 0 rewrote, so the 2026-08-06 deadlock cannot come back.
+        if cached_data is not None and cached_data.get("config_key") != config_key:
+            print(
+                f"[RANK {os.environ.get('RANK', 'NA')}] steps cache config_key "
+                f"{cached_data.get('config_key')!r} != {config_key!r}; rebuilding."
+            )
+            cached_data = None
+
         # ---------- only build by rank0  ----------
         if is_main() and cached_data is None:
             all_steps = self._get_all_steps_single_process()
@@ -1036,6 +1135,8 @@ class LeRobotSingleDataset(Dataset):
                 "total_steps": len(all_steps),
                 "computed_timestamp": pd.Timestamp.now().isoformat(),
                 "delete_pause_frame": self.delete_pause_frame,
+                "pause_filter_mm": self.pause_filter_mm,
+                "pause_filter_key": self.pause_filter_key,
             }
     
             steps_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1070,6 +1171,18 @@ class LeRobotSingleDataset(Dataset):
             "delete_pause_frame": self.delete_pause_frame,
             "dataset_name": self.dataset_name,
         }
+        # Perturb the key ONLY when the filter is on, so every steps cache built
+        # before this change stays valid for the unfiltered path (including the
+        # eval dir, which must never rebuild). Threshold, column and horizon all
+        # change the surviving set, so all three are in the key.
+        if self.pause_filter_mm > 0.0:
+            config_dict["pause_filter"] = (
+                round(float(self.pause_filter_mm), 6),
+                self.pause_filter_key,
+                int(np.max(self.delta_indices[self.pause_filter_key]))
+                if self.pause_filter_key in self.delta_indices
+                else -1,
+            )
         # Create a hash of the configuration
         config_str = str(sorted(config_dict.items()))
         return hashlib.md5(config_str.encode()).hexdigest()[:12]  #
@@ -1080,7 +1193,8 @@ class LeRobotSingleDataset(Dataset):
         all_steps: list[tuple[int, int]] = []
         skipped_trajectories = 0
         processed_trajectories = 0
-        
+        dropped_anchors = 0
+
         # Check if language modality is configured
         has_language_modality = 'language' in self.modality_keys and len(self.modality_keys['language']) > 0
         # TODO why trajectory_length here, why not use data length?
@@ -1113,14 +1227,68 @@ class LeRobotSingleDataset(Dataset):
             if not trajectory_skipped:
                 processed_trajectories += 1
         
+            keep = self._pause_filter_mask(data, int(trajectory_length))
             for base_index in range(trajectory_length):
+                if keep is not None and not keep[base_index]:
+                    dropped_anchors += 1
+                    continue
                 all_steps.append((trajectory_id, base_index))
-                
+
         # Print summary statistics
         print(f"Single-process summary: Processed {processed_trajectories} trajectories, skipped {skipped_trajectories} empty trajectories")
         print(f"Total steps: {len(all_steps)} from {len(self.trajectory_ids)} trajectories")
-                   
+        if self.pause_filter_mm > 0.0:
+            total = len(all_steps) + dropped_anchors
+            print(
+                f"Pause filter {self.pause_filter_mm} mm on {self.pause_filter_key}: "
+                f"kept {len(all_steps)} / {total} anchors "
+                f"({100.0 * len(all_steps) / max(total, 1):.2f}%), "
+                f"dropped {dropped_anchors}"
+            )
+
         return all_steps
+
+    def _pause_filter_mask(self, data: pd.DataFrame, trajectory_length: int):
+        """True where the chunk anchored at t actually MOVES the commanded hand.
+
+        Round 6 (2026-09-13). See the note in __init__ for why this exists. The
+        column slicing mirrors get_state_or_action exactly (original_key lookup,
+        then [:, start:end]), and the end-of-episode clamp mirrors
+        retrieve_data_and_pad's "first_last" strategy, so the motion measured
+        here is the motion the LABEL will actually carry.
+
+        Returns None when the filter is off, in which case every anchor is kept
+        and the steps list is identical to the unfiltered one.
+        """
+        if self.pause_filter_mm <= 0.0:
+            return None
+        key = self.pause_filter_key
+        modality, sub = key.split(".", 1)
+        le_cfg = getattr(self.lerobot_modality_meta, modality)
+        le_key = le_cfg[sub].original_key or sub
+        if le_key not in data.columns:
+            raise ValueError(
+                f"pause_filter_mm={self.pause_filter_mm} but column {le_key!r} "
+                f"(from {key!r}) is missing from {self.dataset_name}"
+            )
+        arr = np.stack(data[le_key].to_numpy())[:, le_cfg[sub].start : le_cfg[sub].end]
+        arr = np.asarray(arr, dtype=np.float64)[:trajectory_length]
+        if key in self.delta_indices:
+            last = int(np.max(self.delta_indices[key]))
+        else:
+            last = max(
+                (int(np.max(v)) for k, v in self.delta_indices.items()
+                 if k.startswith("action.")),
+                default=0,
+            )
+        if last <= 0:
+            raise ValueError(
+                f"pause_filter_mm set but the action horizon for {key!r} is {last}"
+            )
+        t = np.arange(len(arr))
+        end = np.minimum(t + last, len(arr) - 1)
+        motion_mm = np.linalg.norm(arr[end] - arr[t], axis=1) * 1000.0
+        return motion_mm >= self.pause_filter_mm
 
     def _get_position_and_gripper_values(self, data: pd.DataFrame) -> tuple[list, list]:
         """Get position and gripper values based on available columns in the dataset."""
@@ -1412,11 +1580,32 @@ class LeRobotSingleDataset(Dataset):
         return self._pack_sample(data)
 
     def _pack_sample(self, data: dict) -> dict:
-        """Pack transformed modality data into training sample format."""
+        """Pack transformed modality data into training sample format.
+
+        The model-input size comes from ``data_cfg.obs_image_size`` (the same
+        field the SERVER reads in predict_action) and only falls back to 224
+        when it is unset. It used to be hard-coded 224 while serving already
+        honoured obs_image_size, so a config asking for 256 trained at 224 and
+        served at 256 -- no error, no shape change (the Cosmos processor floors
+        the shortest edge at 256 either way, so both spellings tokenise to a
+        16x16 grid), just every frame preprocessed differently at train and
+        deploy time. Measured on a real frame, the two paths differ by 2.2% of
+        the preprocessed tensor's own standard deviation.
+        """
+        raw = None
+        if self.data_cfg is not None:
+            raw = self.data_cfg.get("obs_image_size")
+        keys = self.modality_keys["video"]
+        # obs_image_size is EITHER one [h, w] for every view, OR one [h, w] per
+        # view in video_keys order. Per-view exists because the Cosmos
+        # processor emits an independent token block per image: a rig whose
+        # task-critical detail sits in one camera can spend tokens there
+        # instead of raising every view.
+        sizes = parse_obs_image_size(raw, len(keys))
         step_images = []
-        for video_key in self.modality_keys["video"]:
+        for video_key, size in zip(keys, sizes):
             image = data[video_key][0]
-            image = Image.fromarray(image).resize((224, 224))
+            image = Image.fromarray(image).resize(size)
             step_images.append(image)
 
         language = data[self.modality_keys["language"][0]][0]
@@ -2370,7 +2559,19 @@ class LeRobotMixtureDataset(Dataset):
         trajectory_id = dataset.trajectory_ids[trajectory_index]
 
         # Sample step
-        base_index = rng.choice(dataset.trajectory_lengths[trajectory_index])
+        # With the pause filter OFF this is the old draw, exactly: rng.choice(n)
+        # and rng.choice(arange(n)) return the same value AND leave the generator
+        # in the same state, so the "val"-mode index -> (episode, frame) map, and
+        # every holdout number computed from it, is unchanged. With the filter ON
+        # the draw is over the SURVIVING anchors only -- note that filtering
+        # all_steps alone never reached this line, because this samples from
+        # trajectory_lengths and the mixture calls get_step_data directly.
+        _sampleable = getattr(dataset, "sampleable_base_indices", None)
+        allowed = _sampleable(trajectory_id) if _sampleable is not None else None
+        if allowed is None or len(allowed) == 0:
+            base_index = rng.choice(dataset.trajectory_lengths[trajectory_index])
+        else:
+            base_index = rng.choice(allowed)
         return dataset, trajectory_id, base_index
 
     

@@ -112,6 +112,13 @@ def main():
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--copy", action="store_true",
                     help="copy instead of symlink (for a remote sync)")
+    ap.add_argument("--from-splits", action="store_true",
+                    help="take the split from <src>/meta/splits.json instead of "
+                         "re-randomising. TRAIN becomes train+new. Use this for "
+                         "any dataset that already carries an assignment: "
+                         "re-rolling the dice would put round N's eval episodes "
+                         "into round N+1's training set and quietly destroy the "
+                         "comparison between them.")
     a = ap.parse_args()
 
     src = Path(a.src).expanduser()
@@ -130,21 +137,40 @@ def main():
     if a.holdout in excl:
         raise SystemExit(f"--holdout {a.holdout} is also excluded as broken")
 
-    usable = [i for i in all_ids if i not in excl and i != a.holdout]
-    if a.n_eval >= len(usable):
-        raise SystemExit(f"--n-eval {a.n_eval} >= {len(usable)} usable")
-    rng = random.Random(a.seed)
-    shuffled = usable[:]
-    rng.shuffle(shuffled)
-    ev = sorted(shuffled[:a.n_eval])
-    tr = sorted(shuffled[a.n_eval:])
+    if a.from_splits:
+        sp = json.load(open(src / "meta" / "splits.json"))
+        tr = sorted(set(sp.get("train", [])) | set(sp.get("new", [])))
+        ev = sorted(sp.get("eval", []))
+        hold = sorted(sp.get("holdout", []))
+        unknown = set(tr) | set(ev) | set(hold) - set(all_ids)
+        if not set(tr) <= set(all_ids) or not set(ev) <= set(all_ids):
+            raise SystemExit("splits.json names episodes not in the dataset")
+        if set(tr) & set(ev):
+            raise SystemExit(f"splits.json overlaps train/eval: {sorted(set(tr)&set(ev))}")
+        excl, seedinfo = set(), "meta/splits.json"
+        print(f"source          {src}")
+        print(f"  {len(all_ids)} episodes, video keys {video_keys}")
+        print(f"split taken from meta/splits.json (NOT re-randomised)")
+        print(f"holdout ({len(hold):2d})  {hold}  (in NEITHER split)")
+        print(f"eval    ({len(ev):2d})  {ev}")
+        print(f"train   ({len(tr):2d})  {tr}   = splits.train + splits.new\n")
+    else:
+        usable = [i for i in all_ids if i not in excl and i != a.holdout]
+        if a.n_eval >= len(usable):
+            raise SystemExit(f"--n-eval {a.n_eval} >= {len(usable)} usable")
+        rng = random.Random(a.seed)
+        shuffled = usable[:]
+        rng.shuffle(shuffled)
+        ev = sorted(shuffled[:a.n_eval])
+        tr = sorted(shuffled[a.n_eval:])
+        hold, seedinfo = [a.holdout], a.seed
 
-    print(f"source          {src}")
-    print(f"  {len(all_ids)} episodes, video keys {video_keys}")
-    print(f"excluded (broken crops) {sorted(excl)}")
-    print(f"local holdout           [{a.holdout}]  (in NEITHER split)")
-    print(f"eval  ({len(ev):2d})  {ev}")
-    print(f"train ({len(tr):2d})  {tr}\n")
+        print(f"source          {src}")
+        print(f"  {len(all_ids)} episodes, video keys {video_keys}")
+        print(f"excluded (broken crops) {sorted(excl)}")
+        print(f"local holdout           [{a.holdout}]  (in NEITHER split)")
+        print(f"eval  ({len(ev):2d})  {ev}")
+        print(f"train ({len(tr):2d})  {tr}\n")
 
     for name, ids in (("train", tr), ("eval", ev)):
         dst = Path(f"{prefix}-{name}")
@@ -152,9 +178,9 @@ def main():
         print(f"  wrote {dst}  ({len(ids)} episodes, {n} frames)")
 
     manifest = {
-        "source": str(src), "seed": a.seed,
+        "source": str(src), "seed": seedinfo,
         "excluded_broken_crops": sorted(excl),
-        "local_holdout": [a.holdout],
+        "local_holdout": hold,
         "train": tr, "eval": ev,
     }
     mp = Path(f"{prefix}-split.json")

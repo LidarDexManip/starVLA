@@ -28,6 +28,7 @@ from .concat import ConcatTransform
 # )
 from .video import (
     VideoColorJitter,
+    VideoCenterCrop,
     VideoCrop,
     VideoGrayscale,
     VideoHorizontalFlip,

@@ -1,0 +1,114 @@
+# QwenOFT ROUND 3, "ABSOLUTE XYZ, NO STATE" (2026-09-12): same recipe as
+# round 2 arm B (..._ee_nostate.yaml) with ONE change -- the action target
+# is the ABSOLUTE right-hand position, not the per-step delta.
+#
+# Why (the round-2 closedloop post-mortem, flight 20260912_1917xx): both
+# round-2 arms collapse to EXACT-ZERO chunks at the hover-above-tip scene
+# (100% zero chunks from t=210 s, held for 6+ min). 34-45% of the delta
+# labels are exact zeros (the ~50 Hz teleop command stream under the 60 Hz
+# recorder, plus alignment micro-pauses that concentrate at precisely that
+# scene), so the conditional mean AT that scene is zero -- and for a
+# memoryless policy in closed loop, zero output -> unchanged scene -> zero
+# output is an absorbing state. Openloop-style scenes keep moving (the
+# 19:02 frozen-robot session emitted 0% zero chunks at the START pose), so
+# the stall is scene-conditional, exactly the zero-spike prediction.
+#
+# The fix here: action.right_ee_xyz = FK(cmd[t+i]), pelvis frame, metres
+# (the column build_hil293_ee.py wrote next to the deltas -- no dataset
+# rebuild). A demo pause now labels "hold THIS pose", a scene-dependent
+# continuous value with no shared spike, so the collapse cannot be
+# expressed in the label space. Train q01/q99 span: 116/156/73 mm per dim.
+#
+#   * action    3-dim ABSOLUTE right-hand xyz (was per-step delta);
+#               action_mode stays abs -- the values are direct targets.
+#   * eval      eval_baseline hold_first: the hold-still baseline repeats
+#               each sample's first target row (physical zero would be the
+#               pelvis origin -- meaningless for absolute targets). The
+#               metric keys (eval/mse_zero_action, eval/mse_ratio) are
+#               unchanged so the round-2 dashboards line up.
+#   * serving   rows are IK targets directly: no integration, no
+#               last-command bookkeeping; cap per-step displacement and
+#               the first-row jump (bridge work, separate).
+#   * everything else -- views/augmentation/optimiser/steps -- byte-equal
+#               to round 2 arm B, so the comparison stays controlled.
+#
+# 24000 steps at batch 128 = 10.0 epochs over the 306,891 train frames.
+# GPUs 4-7 (operator: single no-state arm this round), port 29923.
+#
+run_id: starvla_qwenoft_pipette_3view_hil293_ee_abs_nostate
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: jren313-georgia-institute-of-technology
+wandb_project: starVLA_unitree_g1_pipette
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenOFT
+  qwenvl:
+    base_vlm: /data/jren313/models/Qwen3-VL-4B-Instruct
+    attn_implementation: sdpa
+    enable_gradient_checkpointing: true
+  action_model:
+    action_model_type: MLP
+    # == Pipette3ViewOFTEEAbsDataConfig.action_key_dims (right_ee_xyz: 3).
+    action_dim: 3
+    # No state in this arm (paired with include_state false below).
+    state_dim: 0
+    action_horizon: 30
+    action_hidden_dim: 2560
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    # Proprioception OFF, as round 2 arm B.
+    include_state: false
+    data_root_dir: /home/jren313/Datasets
+    data_mix: unitree_g1_pipette_3view_oft_ee_abs_train_mix
+    # Held-out episodes, scored on fixed samples every eval_interval.
+    eval_data_mix: unitree_g1_pipette_3view_oft_ee_abs_eval_mix
+    eval_num_batches: 4
+    # Hold-still baseline for an ABSOLUTE action space: repeat each
+    # sample's first target row (default "zero" is only meaningful for
+    # delta/relative spaces).
+    eval_baseline: hold_first
+    expected_num_views: 3
+    lerobot_version: v2.0
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    # post-crop size of every view (resize 270 -> crop 256 in the DataConfig)
+    obs_image_size: [256, 256]
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 4
+
+trainer:
+  max_train_steps: 24000
+  num_warmup_steps: 600
+  save_interval: 5000
+  eval_interval: 500
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt

@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import torch
 
+from starVLA.dataloader.gr00t_lerobot.datasets import parse_obs_image_size
 from starVLA.dataloader.gr00t_lerobot.registry import (
     DATASET_NAMED_MIXTURES,
     ROBOT_TYPE_CONFIG_MAP,
@@ -152,7 +153,7 @@ def _build_dataset_metadata(
     action_key_dims: Optional[Dict[str, int]] = None,
     state_key_dims: Optional[Dict[str, int]] = None,
     video_keys: Sequence[str] = (),
-    video_resolution: Sequence[int] = (224, 224),
+    video_resolution: Sequence = (224, 224),
     video_fps: float = 30.0,
     video_channels: int = 3,
 ) -> DatasetMetadata:
@@ -231,10 +232,20 @@ def _build_dataset_metadata(
     # never touches video (VideoTransforms are not InvertibleModalityTransform,
     # so unapply() skips them), so these values only need to be schema-valid.
     video_meta: Dict[str, Any] = {}
+    # video_resolution is EITHER one (h, w) shared by every view, OR one per
+    # view in video_keys order. Giving every key the first view's size would
+    # describe a 448 view as 256 in the metadata a transform's set_metadata
+    # reads -- silently, since un-normalisation itself never touches video.
+    def _res_for(key):
+        if video_resolution and not isinstance(video_resolution[0], (int, float)):
+            return tuple(int(v) for v in
+                         video_resolution[list(video_keys).index(key)])
+        return (int(video_resolution[0]), int(video_resolution[1]))
+
     for full_key in video_keys:
         subkey = full_key.split(".", 1)[1] if "." in full_key else full_key
         video_meta[subkey] = {
-            "resolution": (int(video_resolution[0]), int(video_resolution[1])),
+            "resolution": _res_for(full_key),
             "channels": int(video_channels),
             "fps": float(video_fps),
         }
@@ -304,15 +315,41 @@ class PolicyNormProcessor:
         # back to a square default when the cfg does not specify a size.
         _vla_cfg = (cfg.get("datasets", {}) or {}).get("vla_data", {}) or {}
         _img_size = _vla_cfg.get("obs_image_size") or _vla_cfg.get("image_size")
-        if isinstance(_img_size, (list, tuple)) and len(_img_size) >= 2:
-            self._video_resolution = (int(_img_size[-2]), int(_img_size[-1]))
-        else:
-            self._video_resolution = (224, 224)
+        # PER-VIEW SIZES ARE LEGAL HERE and this used to assume they were not.
+        # obs_image_size is either one [h, w] for every view or one PER view,
+        # and the old `int(_img_size[-2])` read the last PAIR of a per-view
+        # config as a scalar -- "int() argument must be ... not 'list'", which
+        # is how round 7 (ego 256 + two wrist views at 448) could not start its
+        # policy server at all. parse_obs_image_size is the single definition
+        # of that test, shared with the training loader and the model server,
+        # because all three grew their own copy and all three got it wrong.
+        self._video_resolutions = parse_obs_image_size(
+            _img_size, len(self._video_keys) or 1)
+        # Kept for callers that want one number: the FIRST view's size. Only
+        # honest when every view shares a size, which is why the per-view list
+        # above is what reaches the metadata.
+        self._video_resolution = self._video_resolutions[0]
 
         # 2) Build training-time transform pipeline.
         transform = self._data_config.transform()
         if not isinstance(transform, ComposedModalityTransform):
             transform = ComposedModalityTransform(transforms=[transform])
+        # Serve-side, VIDEO never passes through this chain: frames reach the
+        # model via the DataConfig's serve_view_preprocess, and apply_state /
+        # unapply_actions only ever feed state.* / action.* dicts. Drop the
+        # video-only transforms so their SETUP guards don't fire against the
+        # placeholder resolutions below -- VideoCenterCrop (the eerel_crop
+        # config's 720/448 pre-resize crops) refuses to "crop" 720 out of the
+        # 256x256 shim this processor reports for every view. A transform
+        # whose apply_to spans other modalities (ConcatTransform) is kept.
+        _video_only = [
+            t for t in transform.transforms
+            if (ks := list(getattr(t, "apply_to", []) or []))
+            and all(str(k).startswith("video.") for k in ks)
+        ]
+        if _video_only:
+            transform = ComposedModalityTransform(transforms=[
+                t for t in transform.transforms if t not in _video_only])
         self._transform = transform
 
         # 3) Pick the requested unnorm_key (finalize; error if still None here).
@@ -341,7 +378,7 @@ class PolicyNormProcessor:
             action_key_dims=self._action_key_dims,
             state_key_dims=self._state_key_dims,
             video_keys=self._video_keys,
-            video_resolution=self._video_resolution,
+            video_resolution=self._video_resolutions,
         )
         self._transform.set_metadata(ds_meta)
         self._transform.eval()  # mark transforms as eval-mode
@@ -359,6 +396,13 @@ class PolicyNormProcessor:
     # ------------------------------------------------------------------
     # Public properties
     # ------------------------------------------------------------------
+    @property
+    def data_config(self) -> Any:
+        """The training-time DataConfig instance. Protocol adapters read
+        optional serve-time hooks off it (``serve_view_preprocess``: the
+        -ee recipe's resize-270 -> center-crop-256 view pipeline)."""
+        return self._data_config
+
     @property
     def action_keys(self) -> List[str]:
         return list(self._action_keys)

@@ -1,0 +1,204 @@
+# QwenOFT ROUND 6, "CHUNK-RELATIVE XYZ, WITH STATE" (2026-09-13).
+#
+# WHY ROUND 3 FAILED, measured rather than argued. Round 3 (absolute xyz)
+# stuck even at the start pose. Its holdout error is 4.13/3.17/3.12 mm while
+# the hand moves only 1.88/1.17/1.34 mm RMS inside one 0.5 s chunk, so in
+# normalised units the motion-to-error ratio is 0.42/0.42/0.47 -- the head was
+# never resolving its own signal. A 2048-sample probe of the round-3 checkpoint
+# (scratchpad r3_shape_probe.py, independently re-derived) confirmed the
+# mechanism: 97.2% of its squared error is a per-chunk COMMON-MODE bias, i.e.
+# one localisation guess shared by all 30 rows. Differencing that bias away
+# leaves real signal (shape SNR 1.26, episode-clustered 95% CI [1.20, 1.32],
+# against 1.01 for a vision-free canned ramp) -- but only 26% of margin, and
+# the checkpoint is already within 1.3% of its own information ceiling, so
+# no post-hoc rescaling of round 3 can rescue it. The head has to be retrained
+# on a target it can actually express.
+#
+# THE TARGET.  rel[i] = FK(cmd[t+i]) - FK(cmd[t]),  i = 0..29, metres, pelvis
+# frame: displacement from the pose the arm was last COMMANDED to. Produced by
+# the loader's existing `action_mode: rel` (which computes a_chunk - state[0])
+# pointed at a state entry that ALIASES the action column -- state.right_ee_cmd
+# -> action.right_ee_xyz. No parquet was rewritten.
+#
+# WHY THE ANCHOR IS THE COMMAND AND NOT THE MEASUREMENT. On this robot
+# FK(commanded) - FK(measured) is a ~15-18 mm quasi-static droop (mean
+# -11.0/+12.0/+1.6 mm; a +-40-frame lag scan improves it by 0.16%, so it is
+# steady-state tracking error, not latency, and FK identity was verified
+# bit-exactly: max residual 1.5e-08 m = 0.5 ULP against both joint vectors).
+# Anchoring at the measured pose would fold that droop into every label, force
+# the head to predict a per-episode quantity that swings +-20 mm in z, and turn
+# any error in it into DRIFT VELOCITY (~3 mm/s in z -- unacceptable for a
+# pipette approaching a tip). Measured motion-to-error, per axis:
+#
+#     round 3 absolute        0.42  0.42  0.47      <- cannot resolve its signal
+#     anchor at measurement   2.16  3.63  0.95      <- z barely at unity
+#     anchor at command       3.63  6.29  5.05      <- this run
+#
+# The gain is a conditioning gain, not new information: the q99 span collapses
+# 116.0/155.6/73.4 mm -> 13.3/10.4/6.9 mm, and q99 normalisation maps
+# [q01, q99] -> [-1, 1], so the millimetre resolution improves in proportion.
+#
+# THE PAUSE FILTER IS LOAD-BEARING, NOT HYGIENE. This parameterisation
+# reintroduces a zero point mass that the absolute space did not have:
+# conditioned on the arm ALREADY being stationary -- which is exactly the state
+# a stalled closed loop is in -- 48.11% of chunks are bit-exact zero. QwenOFT
+# trains with nn.L1Loss, whose optimum is the conditional MEDIAN, and a median
+# sits exactly on zero as soon as the zero mass straddles the 50th percentile.
+# Measured on the stationary bucket, median of the last chunk row:
+#
+#     round-2 per-step delta (known failure)   0.000 / 0.000 / 0.000 mm
+#     anchor at command, unfiltered            0.000 / 0.000 / 0.000 mm
+#     anchor at command, 1.0 mm filter        -0.177 /-0.034 /-0.255 mm
+#
+# So training this action space WITHOUT the filter is predicted to stall the
+# same way round 2 did. `pause_filter_mm: 1.0` drops anchors whose in-chunk
+# commanded motion is under 1 mm: 253,594 of 306,891 anchors survive (82.63%)
+# and the zero mass goes to 0%. It applies to the TRAIN mixture only --
+# prepare_holdout_batches forces pause_filter_mm 0.0 so the holdout stays the
+# same fixed sample set as rounds 2-5 and eval/mse_ratio stays comparable.
+#
+# STATE IS ON THIS ROUND (operator call, and it is now safe). Rounds 2-5 served
+# --no_state because the server fed RAW joint angles to checkpoints trained on
+# q99-normalised ones; that gap is closed -- gr00t_obs_adapter.py:272 now calls
+# PolicyNormProcessor.apply_state(), which replays the training state
+# transforms. 35 dims = 29 body joints + FK xyz of the MEASURED joints + FK xyz
+# of the COMMANDED joints. The third block is the chunk's own anchor, so the
+# head no longer has to localise the hand from pixels before it can express a
+# 1.5 mm move -- the same burden the action space removes, removed twice. It is
+# causally available at serve time (the bridge already tracks the commanded
+# hand pose for the round-2 delta lane) and it is SINGLE-FRAME: state_indices
+# stays [0], so this is not a state-history profile and the HG-DAgger
+# memoryless rule still holds.
+#
+# WHAT THIS RUN DOES *NOT* FIX. Three layers were separated in the post-mortem:
+# (1) resolution -- fixed here, measured; (2) the zero point mass -- fixed here
+# by the filter; (3) MULTI-MODALITY -- at a stationary scene the surviving
+# futures are still ~50:50 directionally opposed (x 47:53 after filtering), and
+# a point-prediction head must output something near the middle. That is the
+# documented look-alike aliasing (68% opposed futures on look-alike frames) and
+# no action space can fix it. The planned next step is PHASE CONDITIONING --
+# language_keys -> a per-frame annotation.human.phase, which this dataset does
+# not yet have and which has to be built. Holding it back keeps round 6 a
+# controlled change and round 7 a clean +1.
+#
+# DATA: hil293 only (249 train / 44 eval episodes, the 15% episode holdout at
+# seed 1234), via g1-pipette-3view-hil293-eerel-{train,eval} -- the -ee dirs'
+# data/ and videos/ symlinked, meta/ copied, modality.json given the two
+# aliases. A separate directory is mandatory: the statistics cache key is only
+# {"mode": action_mode} and lives at meta/stats_gr00t.json INSIDE the dataset
+# dir, so a rel run and an abs run sharing a dir delete each other's cache on
+# every launch, and rounds 3/5 still need the abs stats intact.
+#
+# 19,800 steps at batch 128 = 10.0 epochs over the 253,594 surviving anchors.
+# TEN, not twenty, and deliberately: round 3 was 24,000 steps = 10.0 epochs over
+# its own 306,891 frames, so matching the EPOCH count is what makes round 6 vs
+# round 3 a controlled comparison -- which is the entire point of this run.
+# (A first launch at 20 epochs was stopped at step 2,194 for exactly this
+# reason; it also cost 15.8 h against 8.2 h.) save_interval 2,000 gives 9
+# checkpoints instead of 3: round 3's true best, ratio 5.34 @ step 18,500, fell
+# between its 5,000-step saves and was never written to disk.
+#
+# Cost of state, measured on round 2's own A/B (same data, same settings, only
+# the switch differs): 1.23 s/it no-state vs 1.41 s/it with state, i.e. 1.15x.
+# This run sits at 1.44 s/it, so ~2% of contention from other jobs on GPUs 4-7.
+#
+# GPUs 0-3 (freed by stopping round 5 at step 25,078), port 29926.
+#
+run_id: starvla_qwenoft_pipette_3view_hil293_eerel_state
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: jren313-georgia-institute-of-technology
+wandb_project: starVLA_unitree_g1_pipette
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenOFT
+  qwenvl:
+    base_vlm: /data/jren313/models/Qwen3-VL-4B-Instruct
+    attn_implementation: sdpa
+    # INERT on this backbone, kept only for family consistency. Only
+    # MiniCPM_V, CosmosGR00T_N1d7 and Gemma4 honour this key; the Qwen3-VL
+    # interface (modules/vlm/QWen3.py) never calls gradient_checkpointing_enable.
+    # trainer.gradient_checkpointing below is read by train_starvln.py, NOT by
+    # train_starvla.py. So rounds 2-6 have all trained with checkpointing OFF
+    # despite both keys saying true -- which is why they run at 1.2-1.4 s/it and
+    # 104 of 183 GB. Do not count on either key for memory headroom.
+    enable_gradient_checkpointing: true
+  action_model:
+    action_model_type: MLP
+    # == Pipette3ViewOFTEERelDataConfig.action_key_dims (right_ee_rel: 3).
+    action_dim: 3
+    # == sum(state_key_dims): 29 joints + 3 measured FK xyz + 3 commanded FK xyz.
+    state_dim: 35
+    action_horizon: 30
+    action_hidden_dim: 2560
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    # Proprioception ON this round -- see the header.
+    include_state: true
+    data_root_dir: /home/jren313/Datasets
+    data_mix: unitree_g1_pipette_3view_oft_ee_rel_train_mix
+    # Held-out episodes, scored on fixed samples every eval_interval.
+    eval_data_mix: unitree_g1_pipette_3view_oft_ee_rel_eval_mix
+    eval_num_batches: 4
+    # Row 0 of this label is identically zero, so repeating it IS the
+    # physical hold-still baseline, in raw or normalised units alike.
+    eval_baseline: hold_first
+    expected_num_views: 3
+    lerobot_version: v2.0
+    action_type: abs_qpos
+    # THE action-space change. apply_keys/state_map are both required: without
+    # the map, _infer_state_key_for_action looks for state.right_ee_rel, does
+    # not find it, and _apply_action_mode SILENTLY SKIPS the subtraction
+    # (datasets.py:1332-1333), leaving absolute labels behind.
+    action_mode: rel
+    action_mode_apply_keys: ["action.right_ee_rel"]
+    action_mode_state_map:
+      action.right_ee_rel: state.right_ee_cmd
+    # Drop chunk anchors whose in-chunk commanded-hand motion is under this
+    # many millimetres. TRAIN MIXTURE ONLY (forced to 0.0 for the holdout in
+    # prepare_holdout_batches). See the header for why this is load-bearing.
+    pause_filter_mm: 1.0
+    pause_filter_key: action.right_ee_xyz
+    sequential_step_sampling: false
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    # post-crop size of every view (resize 270 -> crop 256 in the DataConfig)
+    obs_image_size: [256, 256]
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 4
+
+trainer:
+  # 253,594 surviving anchors / 128 = 1,981.2 steps per epoch; x10 = 19,812.
+  max_train_steps: 19800
+  num_warmup_steps: 600
+  # 9 saves (2,000 .. 18,000) + final_model, 8.6 GB each = ~86 GB of the 169
+  # free. Fine-grained ON PURPOSE -- see the header on round 3's lost best.
+  save_interval: 2000
+  eval_interval: 500
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt

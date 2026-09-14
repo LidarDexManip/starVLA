@@ -1,0 +1,101 @@
+# QwenOFT ROUND 2, arm B "NO STATE" (2026-09-12): the pi0.5-hil194 data
+# recipe on hil293, same Qwen3-VL-4B + MLP-L1 head and optimiser as round 1
+# (starvla_qwenoft_pipette_3view_hil293.yaml). Two arms differ ONLY in
+# include_state / state_dim; this one runs on GPUs 4-7, the with-state arm
+# (..._ee_state.yaml) on 0-3.
+#
+# What changed from round 1 (details in Pipette3ViewOFTEEDataConfig):
+#   * action  27 absolute joint targets -> 3-dim right-hand FK xyz DELTA per
+#             60 Hz step (pelvis frame, right_rubber_hand, commanded joints),
+#             precomputed in the -ee dataset, so action_mode stays abs;
+#   * state   32 = 29 measured body joints + FK xyz of the measured joints,
+#             q99 -> pi0.5-style discrete tokens in the prompt (THIS ARM);
+#   * views   all three at 256 (was ego 256 + wrists 448), 95% random crop
+#             + +-5 deg rotation per view, shared ColorJitter 0.3/0.4/0.5;
+#   * data    15% episode holdout (249 train / 44 eval, seed 1234) scored
+#             every eval_interval on fixed held-out samples, with a
+#             zero-action ("hold still") baseline -- eval/* in the log.
+#
+# 24000 steps at batch 128 = 10.0 epochs over the 306,891 train frames
+# (operator cut it from 60000 / 25 epochs at step ~1000, 2026-09-12; the
+# cosine schedule was rebuilt over 24000 by relaunching, not by stopping early).
+# per_device 16 x accum 2 on 4 GPUs = 128 (launcher). 32 x 1 fits in memory
+# (117 GB) but GPU 0 is shared with another user's 66 GB job, and at 4
+# loader workers both spellings were data-bound (~1.6 s/it): 12 workers now.
+#
+run_id: starvla_qwenoft_pipette_3view_hil293_ee_nostate
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: jren313-georgia-institute-of-technology
+wandb_project: starVLA_unitree_g1_pipette
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenOFT
+  qwenvl:
+    base_vlm: /data/jren313/models/Qwen3-VL-4B-Instruct
+    attn_implementation: sdpa
+    enable_gradient_checkpointing: true
+  action_model:
+    action_model_type: MLP
+    # == Pipette3ViewOFTEEDataConfig.action_key_dims (right_ee_dxyz: 3).
+    action_dim: 3
+    # No state in this arm (paired with include_state false below); the
+    # state arm sets 32 here purely for the record.
+    state_dim: 0
+    action_horizon: 30
+    action_hidden_dim: 2560
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    # ARM B: proprioception OFF (round-1 setting); the loader never packs state.
+    include_state: false
+    data_root_dir: /home/jren313/Datasets
+    data_mix: unitree_g1_pipette_3view_oft_ee_train_mix
+    # Held-out episodes, scored on fixed samples every eval_interval.
+    eval_data_mix: unitree_g1_pipette_3view_oft_ee_eval_mix
+    eval_num_batches: 4
+    expected_num_views: 3
+    lerobot_version: v2.0
+    action_type: abs_qpos
+    # The delta is precomputed in the parquet; the loader's own delta mode
+    # would make step 0 "commanded - measured" (~20 mm) and own the q99.
+    action_mode: abs
+    sequential_step_sampling: false
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    # post-crop size of every view (resize 270 -> crop 256 in the DataConfig)
+    obs_image_size: [256, 256]
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 4
+
+trainer:
+  max_train_steps: 24000
+  num_warmup_steps: 600
+  save_interval: 5000
+  eval_interval: 500
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt

@@ -44,6 +44,24 @@ from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 
 
+def _per_view_sizes(obs_image_size, n_views):
+    """(w, h) per view from the yaml's obs_image_size, which is EITHER one
+    [h, w] for every view OR one [h, w] per view in video_keys order (the
+    pipette mixres contract: ego 256 + two wrist views at 448). Inlined so
+    this framework does not depend on which dataloader revision a checkout
+    carries; raises ValueError on any other shape."""
+    s = list(obs_image_size)
+    if len(s) == 2 and all(isinstance(v, (int, float)) for v in s):
+        h, w = int(s[0]), int(s[1])
+        return [(w, h)] * n_views
+    if len(s) == n_views and all(
+            isinstance(v, (list, tuple)) and len(v) == 2 for v in s):
+        return [(int(v[1]), int(v[0])) for v in s]
+    raise ValueError(
+        f"obs_image_size {obs_image_size!r} is neither one [h, w] nor one "
+        f"[h, w] per view for {n_views} views")
+
+
 # ──────────────────────────────────────────────────────────────────────
 #  Default Config for QwenOFT
 #  - Documents every framework-level parameter with type + description
@@ -289,9 +307,23 @@ class Qwenvl_OFT(baseframework):
             self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
         )
 
+        # obs_image_size is EITHER one [h, w] for every view, OR one [h, w] per
+        # view in the DataConfig's video_keys order (the pipette mixres
+        # contract: ego 256 + two wrist views at 448). The per-view spelling
+        # must be honoured here as it is in the loader's _pack_sample and in
+        # CosmosGR00T_N1d7.predict_action -- resize_images() recursed into the
+        # per-view list and handed PIL a 3-element "size".
         train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
         if train_obs_image_size:
-            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+            n_views = len(batch_images[0]) if batch_images and batch_images[0] else 1
+            try:
+                sizes = _per_view_sizes(train_obs_image_size, n_views)
+            except ValueError as e:
+                logger.error(f"[camera contract] {e}; serving views unresized")
+                sizes = None
+            if sizes is not None:
+                batch_images = [[im.resize(sz) for im, sz in zip(views, sizes)]
+                                for views in batch_images]
 
         # step 0: add special action token to instruction
         action_tokens = (

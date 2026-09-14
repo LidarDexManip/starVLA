@@ -35,6 +35,8 @@ from typing import List, Optional
 import numpy as np
 import torch
 
+from starVLA.dataloader.gr00t_lerobot.datasets import parse_obs_image_size
+
 _workspace_root = Path(__file__).parent.parent.parent.parent.parent
 if str(_workspace_root) not in sys.path:
     sys.path.insert(0, str(_workspace_root))
@@ -538,9 +540,26 @@ class CosmosGR00T_N1d7(baseframework):
         state = [ex["state"] for ex in examples] if "state" in examples[0] else None
         self._check_num_views(images)
 
+        # obs_image_size is EITHER one [h, w] for every view, OR one [h, w] per
+        # view in the DataConfig's video_keys order. The per-view spelling must
+        # be honoured HERE as well as in the loader's _pack_sample, or a
+        # checkpoint trained with e.g. ego 256 + two wrist views at 448 would
+        # be served three 256s -- no error, just every view off-distribution.
         train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
         if train_obs_image_size:
-            images = resize_images(images, target_size=train_obs_image_size)
+            # parse_obs_image_size is the SINGLE definition of the flat-vs-
+            # per-view test, shared with the training loader and the serving
+            # norm processor. All three used to carry their own copy and all
+            # three were wrong the same way -- see its docstring.
+            n_views = len(images[0]) if images and images[0] else 1
+            try:
+                sizes = parse_obs_image_size(train_obs_image_size, n_views)
+            except ValueError as e:
+                logger.error(f"[camera contract] {e}; serving views unresized")
+                sizes = None
+            if sizes is not None:
+                images = [[im.resize(sz) for im, sz in zip(views, sizes)]
+                          for views in images]
 
         vl_embeds, image_mask, attn_mask = self._encode_vl(images, instructions)
         device = vl_embeds.device

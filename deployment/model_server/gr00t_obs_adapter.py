@@ -229,6 +229,15 @@ class Gr00tCompatPolicy:
         if not isinstance(video, dict) or not video:
             raise KeyError("observation is missing the 'video' modality dict")
         images = [_latest_image(video[k]) for k in self._resolve_video_order(video)]
+        # Optional serve-time view hook, defined by the checkpoint's own
+        # DataConfig (single source of the training-time view pipeline).
+        # The -ee recipe resizes to 270 then CENTER-crops 256 — a straight
+        # resize to the model input size would serve 5% more field of view
+        # than training ever saw. After this the framework's own
+        # obs_image_size resize is a no-op (the frames already match it).
+        _dc = getattr(self._proc, "data_config", None)
+        if _dc is not None and hasattr(_dc, "serve_view_preprocess"):
+            images = _dc.serve_view_preprocess(images)
 
         example: Dict[str, Any] = {
             "image": images,

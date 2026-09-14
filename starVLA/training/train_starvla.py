@@ -136,6 +136,88 @@ def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
     return vla_train_dataloader
 
 
+class _DataCfgOverride:
+    """``cfg.datasets.vla_data`` with a few keys replaced.
+
+    get_vla_dataset and the LeRobot datasets only ever read the data config
+    through attribute access and ``.get()``, so a thin proxy is enough to
+    point the SAME recipe (DataConfig, transforms, obs_image_size,
+    include_state, action_mode ...) at a different mixture."""
+
+    def __init__(self, base, **overrides):
+        self._base = base
+        self._over = overrides
+
+    def __getattr__(self, name):
+        if name in ("_base", "_over"):
+            raise AttributeError(name)
+        if name in self._over:
+            return self._over[name]
+        return getattr(self._base, name)
+
+    def get(self, name, default=None):
+        if name in self._over:
+            return self._over[name]
+        return self._base.get(name, default)
+
+
+def prepare_holdout_batches(cfg):
+    """A FIXED set of held-out samples per rank for open-loop scoring.
+
+    Opt-in through ``datasets.vla_data.eval_data_mix`` (a DATASET_NAMED_MIXTURES
+    key whose dataset dir holds episodes the training mixture never sees).
+    The mixture is built in ``val`` mode -- ``sample_step`` is then seeded by
+    the index, so the same indices return the same (episode, frame) every
+    call -- and every transform is switched to eval (centre crop, no
+    rotation / colour jitter), exactly what the policy server would feed.
+    Rank r takes indices [r*K*B, (r+1)*K*B), K = eval_num_batches (default
+    4), B = eval_batch_size (default per_device_batch_size), decoded ONCE at
+    startup and kept as PIL images (a few tens of MB), so each evaluation is
+    K forward passes and no dataloader.
+
+    The in-sample ``mse_score`` is kept as it was; this adds ``eval/*``.
+    """
+    vcfg = cfg.datasets.vla_data
+    eval_mix = vcfg.get("eval_data_mix", None)
+    if not eval_mix:
+        return None
+    from torch.utils.data import Subset
+
+    from starVLA.dataloader.lerobot_datasets import collate_fn, get_vla_dataset
+
+    k = int(vcfg.get("eval_num_batches", 4))
+    b = int(vcfg.get("eval_batch_size", vcfg.per_device_batch_size))
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    logger.info(f"holdout eval:building eval mixture `{eval_mix}` ({k} batches x {b} per rank)")
+    # The pause filter is a TRAINING-mixture decision and must never reach the
+    # holdout: in "val" mode sample_step is seeded by the raw index, so a
+    # filtered eval dataset would map the same indices to different
+    # (episode, frame) pairs and eval/mse_ratio would stop being comparable with
+    # rounds 2-5. Suppressed here rather than in the yaml, so no recipe can undo it.
+    ds = get_vla_dataset(
+        data_cfg=_DataCfgOverride(vcfg, data_mix=eval_mix, pause_filter_mm=0.0),
+        mode="val",
+    )
+    for single in ds.datasets:
+        single.transforms.eval()
+    start = rank * k * b
+    if start + k * b > len(ds):
+        raise ValueError(f"[holdout] {k}x{b} samples per rank exceed the eval mixture ({len(ds)})")
+    loader = DataLoader(
+        Subset(ds, list(range(start, start + k * b))),
+        batch_size=b,
+        shuffle=False,
+        num_workers=int(vcfg.get("num_workers", 4)),
+        collate_fn=collate_fn,
+    )
+    batches = [batch for batch in loader]
+    n = sum(len(batch) for batch in batches)
+    logger.info(f"holdout eval:rank {rank}: {len(batches)} batches / {n} samples cached")
+    if dist.is_initialized():
+        barrier()
+    return batches
+
+
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
     """Set optimizer and scheduler.
 
@@ -190,13 +272,17 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
 
 
 class VLATrainer(TrainerUtils):
-    def __init__(self, cfg, model, vla_train_dataloader, optimizer, lr_scheduler, accelerator):
+    def __init__(self, cfg, model, vla_train_dataloader, optimizer, lr_scheduler, accelerator,
+                 holdout_batches=None):
         self.config = cfg
         self.model = model
         self.vla_train_dataloader = vla_train_dataloader
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
+        # see prepare_holdout_batches; None keeps the trainer exactly as before
+        self.holdout_batches = holdout_batches
+        self._holdout_norm = None
 
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
@@ -432,6 +518,7 @@ class VLATrainer(TrainerUtils):
 
             if self.completed_steps % self.config.trainer.eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
+                step_metrics = self.eval_holdout(step_metrics)
 
             step_metrics["timing/data"] = t_end_data - t_start_data
             step_metrics["timing/model"] = t_end_model - t_start_model
@@ -463,6 +550,109 @@ class VLATrainer(TrainerUtils):
         del examples
         if dist.is_initialized():
             barrier()
+        return step_metrics
+
+    def _holdout_normalisation(self):
+        """(normalised zero action, half q99 span per dim) from the run's
+        dataset_statistics.json, written by build_dataloader on rank 0 before
+        the barrier in prepare_data. Both are None when the file cannot be
+        read or does not match the action width -- the mse is still logged,
+        only the baseline and the physical-unit RMSE are skipped."""
+        if self._holdout_norm is not None:
+            return self._holdout_norm
+        zero, half_span = None, None
+        try:
+            stats = json.load(open(os.path.join(self.config.output_dir, "dataset_statistics.json")))
+            act = next(iter(stats.values()))["action"]
+            q01, q99 = np.asarray(act["q01"], dtype=np.float64), np.asarray(act["q99"], dtype=np.float64)
+            span = np.where(q99 != q01, q99 - q01, 1.0)
+            # StateActionTransform's q99 formula and clamp, applied to a zero action
+            zero = np.clip(2.0 * (0.0 - q01) / span - 1.0, -2.2, 2.2)
+            zero[q99 == q01] = 0.0
+            half_span = span / 2.0
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            logger.warning(f"[holdout] no q01/q99 for the zero-action baseline: {exc}")
+        self._holdout_norm = (zero, half_span)
+        return self._holdout_norm
+
+    def eval_holdout(self, step_metrics: dict = None) -> dict:
+        """Open-loop score on the FIXED held-out samples of every rank.
+
+        Logs, all in the head's normalised action space:
+          eval/mse_holdout       mean squared error over samples x horizon x dims
+          eval/mse_zero_action   the same for the HOLD-STILL baseline. With
+                                 ``datasets.vla_data.eval_baseline: zero``
+                                 (default) that is a constant physical-zero
+                                 action -- "hold still" for a delta/relative
+                                 space, meaningless for absolute targets.
+                                 ``eval_baseline: hold_first`` repeats each
+                                 sample's FIRST target row over the horizon
+                                 -- "hold still" for an ABSOLUTE space (the
+                                 metric key stays the same so dashboards
+                                 line up across the A/B arms).
+          eval/mse_ratio         mse_holdout / mse_zero_action (< 1 = the
+                                 policy beats holding still)
+        and, when q01/q99 are known, eval/rmse_dim{i} (and _zero) in the
+        action's own units per step (metres for the FK heads).
+        Sums are all-reduced so the number is over every rank's samples.
+        """
+        if not self.holdout_batches:
+            return step_metrics
+        step_metrics = step_metrics if step_metrics is not None else {}
+        model = self.accelerator.unwrap_model(self.model)
+        zero, half_span = self._holdout_normalisation()
+        baseline_mode = self.config.datasets.vla_data.get("eval_baseline", "zero")
+        assert baseline_mode in ("zero", "hold_first"), baseline_mode
+        sse = sse0 = 0.0
+        count = 0
+        per_dim = per_dim0 = None
+        for examples in self.holdout_batches:
+            out = model.predict_action(examples=examples, use_ddim=True, num_ddim_steps=20)
+            pred = np.asarray(out["normalized_actions"], dtype=np.float64)
+            tgt = np.asarray(np.array([e["action"] for e in examples]), dtype=np.float64)
+            tgt = tgt[:, -pred.shape[1]:, :]
+            err = pred - tgt
+            sse += float((err ** 2).sum())
+            count += err.size
+            d = (err ** 2).sum(axis=(0, 1))
+            per_dim = d if per_dim is None else per_dim + d
+            if baseline_mode == "hold_first":
+                base = np.broadcast_to(tgt[:, :1, :], tgt.shape)
+            elif zero is not None and zero.shape[0] == tgt.shape[-1]:
+                base = np.broadcast_to(zero[None, None, :], tgt.shape)
+            else:
+                base = None
+            if base is not None:
+                err0 = base - tgt
+                sse0 += float((err0 ** 2).sum())
+                d0 = (err0 ** 2).sum(axis=(0, 1))
+                per_dim0 = d0 if per_dim0 is None else per_dim0 + d0
+        n_dims = int(per_dim.shape[0])
+        vec = np.concatenate([[sse, sse0, float(count)], per_dim,
+                              per_dim0 if per_dim0 is not None else np.zeros(n_dims)])
+        t = torch.tensor(vec, dtype=torch.float64, device=self.accelerator.device)
+        if dist.is_initialized():
+            dist.all_reduce(t)
+        vec = t.cpu().numpy()
+        sse, sse0, count = vec[0], vec[1], vec[2]
+        per_dim, per_dim0 = vec[3:3 + n_dims], vec[3 + n_dims:3 + 2 * n_dims]
+        if count <= 0:
+            return step_metrics
+        rows = count / n_dims  # (sample, step) pairs per dim
+        step_metrics["eval/mse_holdout"] = sse / count
+        if per_dim0 is not None and sse0 > 0:
+            step_metrics["eval/mse_zero_action"] = sse0 / count
+            step_metrics["eval/mse_ratio"] = (sse / count) / max(sse0 / count, 1e-12)
+        if half_span is not None and half_span.shape[0] == n_dims:
+            for i in range(n_dims):
+                step_metrics[f"eval/rmse_dim{i}"] = float(np.sqrt(per_dim[i] / rows) * half_span[i])
+                if per_dim0 is not None and sse0 > 0:
+                    step_metrics[f"eval/rmse_dim{i}_zero"] = float(np.sqrt(per_dim0[i] / rows) * half_span[i])
+        if self.accelerator.is_main_process:
+            logger.info(
+                f"holdout eval: step{self.completed_steps}: "
+                + ", ".join(f"{k.split('/', 1)[1]}={v:.4g}" for k, v in step_metrics.items()
+                            if k.startswith("eval/")))
         return step_metrics
 
     def _log_training_config(self):
@@ -537,6 +727,7 @@ def main(cfg) -> None:
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    holdout_batches = prepare_holdout_batches(cfg=cfg)
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
     trainer = VLATrainer(
@@ -546,6 +737,7 @@ def main(cfg) -> None:
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         accelerator=accelerator,
+        holdout_batches=holdout_batches,
     )
 
     trainer.prepare_training()
