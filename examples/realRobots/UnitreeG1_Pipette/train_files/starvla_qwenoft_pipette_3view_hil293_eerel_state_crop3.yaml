@@ -1,0 +1,261 @@
+# QwenOFT ROUND 8, "ROUND 7 PLUS wrist_right CROPPED 1080 -> 720" (2026-09-15).
+#
+# THE ONLY DIFFERENCE FROM ROUND 7 is one view's crop. rgb (centre 720 of
+# 1280x720) and wrist_left (centre 448 of 1080) are inherited untouched, as are
+# the action space, pause filter, state block, horizon, augmentation, dataset
+# and epoch count. Round 7's header follows below, still in force.
+#
+#     video.wrist_right   1080x1080 -> centre 720x720 -> 270 -> 256
+#                         scale 0.237 -> 0.356,  tip 5.0 -> 7.1 px  (1.42x)
+#
+# WHY. Two measurements on round 7 @ steps_2000 (its best, holdout 0.05723)
+# point the same way.
+#
+# (a) THE VIEW WENT IDLE. A gray-frame ablation over 96 holdout chunks --
+#     blank one view, re-measure per-axis error:
+#         blank rgb           x -6%   y  +2%   z   -0%
+#         blank wrist_left    x +2%   y +18%   z +107%
+#         blank wrist_right   x +4%   y  -6%   z   -1%
+#     Round 7's crops moved essentially all reliance onto wrist_left; blanking
+#     wrist_right even IMPROVES y slightly. Round 6, for contrast, had the two
+#     wrist views sharing (wrist_left +17% y / +16% z, wrist_right +10% / +15%).
+#     That is a fragility as much as a waste: wrist_left's 448 box loses the
+#     tip in ~6-12% of frames, and z error DOUBLES without it, so the run now
+#     depends on one view that is sometimes blind.
+#
+# (b) IT IS THE BEST "WHICH WELL" VIEW AND IT IS BARELY USING ITS PIXELS.
+#     wrist_right is fixed and top-down with the rack centred and static, so
+#     unlike wrist_left the centre box does not chase a moving hand. Coverage,
+#     measured before launch with the annulus-context tip detector (30 episodes
+#     x 6 offsets across the approach, scratchpad round8_crop_check.py):
+#         wrist_right centre 720   tip inside 98.3%, worst single offset 96.3%
+#         (for reference, on the same sample: wrist_left 448 = 88.0% / 78.9%)
+#     720 keeps the whole rack, the pipette and the green tip in frame for the
+#     entire approach. NOTE the same run measured centre 640 at IDENTICAL
+#     coverage (98.3% / 96.3%) with a 12% bigger tip (8.0 px); 720 is used here
+#     because it is the operator's spec and because "center:720" is an
+#     already-shipped bridge view_crop mode (rounds 12/13), i.e. zero new
+#     serving code. 512 drops to 91.4% and is out.
+#
+# WHAT THIS CANNOT DO. wrist_right's y sensitivity is ~0.01 px/mm (y runs down
+# its optical axis); 1.42x magnification makes that ~0.014. This crop cannot
+# let the model watch itself move in y. What it can do is make the TARGET's
+# identity -- the one well holding a tip -- easier to read, which combined with
+# the commanded hand pose already in the 35-dim state is a different route to
+# the same number. Read a y improvement as better target identification, not as
+# new y observability.
+#
+# STILL NOT FIXED, deliberately: the L1-median / per-axis zero-mass mechanism.
+# Round 7's aim slopes (predicted vs true net displacement, 96 chunks) were
+# x 0.56 / y 0.18 / z 0.82 with signed bias <= 0.3 mm: the head under-commits
+# laterally and outputs ~the dataset-mean landing point in y. Its y ratio did
+# improve (0.90 vs round 6's 0.99) but by predicting that mean MORE CLEANLY
+# (pred sd 1.56 -> 1.01 mm), not by tracking the target. The loss-side fix
+# (per-axis motion weighting + Huber) is the designated NEXT round and is kept
+# out of this one so this stays a single-variable comparison against round 7.
+#
+# THREE GPUs (4,5,6 -- 0-3 are another user's Isaac job), and the batch cannot
+# be 128 because 128 is not divisible by 3. per_device 21 x accum 2 x 3 = 126,
+# which is 1.6% under round 7's 128 and, more importantly, keeps the step-to-
+# epoch mapping aligned: 253,594 / 126 = 2,012.7 steps per epoch against round
+# 7's 1,981.2, so "step N" means nearly the same amount of data seen in both
+# runs. That matters here because BOTH rounds 6 and 7 hit their holdout minimum
+# at ~one epoch. 10 epochs = 20,126 -> 20,100 steps (round 7 ran 19,800 = its
+# own 10 epochs; epochs are matched, not steps, as in round 6 vs round 3).
+#
+# save_interval 1,000 rather than 2,000: round 7's holdout valley was NARROW
+# (1,500-2,500, best 0.05723 @ 2,000 against 0.0642+ everywhere after 3,000)
+# and its 2,000-step saves caught the minimum by luck. 20 saves x 9.1 GB =
+# 182 GB of the 1.4 TB free on /data. Training is unaffected; this is a
+# measurement change only.
+#
+# HOLDOUT COMPARABILITY, the one thing 3 GPUs unavoidably perturbs. The fixed
+# holdout is indices [0, ranks*K*B) with K = eval_num_batches, B =
+# eval_batch_size, so the SUBSET depends on the rank count: round 7 on 8 ranks
+# scored [0, 512). Left at K=4/B=16 this run would score only [0, 192) and its
+# raw mse would not be comparable at all. K=10, B=16 gives 3 x 10 x 16 = 480,
+# i.e. [0, 480) -- a strict subset of round 7's 512, 94% of the same chunks, so
+# the baselines (and therefore the ratios) land within noise of round 7's.
+# eval_batch_size is pinned to 16 rather than following per_device_batch_size
+# for exactly this reason: the index blocks must stay 16-aligned.
+#
+# ---------------------------------------------------------------------------
+# Round 7's header follows, unchanged and still in force.
+# ---------------------------------------------------------------------------
+#
+# QwenOFT ROUND 7, "ROUND 6 WITH THE VIEWS CROPPED BEFORE THE RESIZE"
+# (2026-09-14).
+#
+# THE ONLY DIFFERENCE FROM ROUND 6 is how many native pixels land on the target.
+# Action space, pause filter, state block, horizon, augmentation, dataset,
+# holdout and epoch count are inherited unchanged, so a difference in outcome is
+# the input geometry and nothing else.
+#
+# WHY. Round 6 learns x (holdout ratio 0.749) and z (0.769) and learns NOTHING
+# on y (0.918-1.009 -- no better than predicting the hand does not move
+# laterally); on the robot it descends cleanly and misses in y. The target is
+# the ONE well that has a tip in it, so y is decided by finding that tip.
+# Measured with an annulus-context colour classifier, checked by eye (two
+# earlier detectors silently tracked a green marker on the WRIST and were
+# discarded), the tip subtends IN ROUND 6'S INPUT:
+#
+#     rgb           8 x  8 native  ->   1.7 x 3.0 px      2.0% of a 16x16 patch
+#     wrist_left   20 x 20 native  ->   5.0 x 5.0 px      9.8%
+#     wrist_right  21 x 22 native  ->   5.2 x 5.5 px     11.3%
+#
+# Under 2 px wide in the side view -- and the side view is the only one whose y
+# sensitivity is real (y -> dx -0.425 px/mm; wrist_right has y almost exactly
+# along its optical axis, dx +0.010 / dy -0.087). That view is 1280x720 resized
+# to a SQUARE 270, so the axis carrying y is squeezed 4.74x against the
+# vertical's 2.67x.
+#
+# WHAT ROUND 7 CHANGED (DataConfig Pipette3ViewOFTEERelCropDataConfig):
+#     video.rgb          centre 720x720 of 1280x720   tip 1.7 -> 3.0 px wide
+#     video.wrist_left   centre 448x448 of 1080x1080  tip 5.0 -> 12.1 px
+# Token count is IDENTICAL to round 6: every view still arrives at 256x256.
+# Coverage checked before launch: rgb 100%/100%, wrist_left 93.8%/83.3%.
+#
+# ---------------------------------------------------------------------------
+# Round 6's header, abridged to what still governs this run.
+# ---------------------------------------------------------------------------
+#
+# THE TARGET.  rel[i] = FK(cmd[t+i]) - FK(cmd[t]),  i = 0..29, metres, pelvis
+# frame: displacement from the pose the arm was last COMMANDED to. Produced by
+# the loader's existing `action_mode: rel` pointed at a state entry that ALIASES
+# the action column -- state.right_ee_cmd -> action.right_ee_xyz. No parquet was
+# rewritten. Anchoring at the COMMAND (not the measurement) keeps the robot's
+# ~18 mm quasi-static droop out of the labels, where it would otherwise become
+# drift velocity; motion-to-error per axis goes 0.42/0.42/0.47 (round 3
+# absolute) -> 3.63/6.29/5.05, and the q99 span collapses 116.0/155.6/73.4 mm
+# -> 13.3/10.4/6.9 mm.
+#
+# THE PAUSE FILTER IS LOAD-BEARING, NOT HYGIENE. Conditioned on the arm already
+# being stationary -- the state a stalled closed loop is in -- 48.11% of chunks
+# are bit-exact zero, and nn.L1Loss optimises the conditional MEDIAN, which sits
+# on zero as soon as the zero mass straddles the 50th percentile (round 2's
+# failure mode). `pause_filter_mm: 1.0` keeps 253,594 of 306,891 anchors
+# (82.63%) and the zero mass goes to 0%. TRAIN MIXTURE ONLY --
+# prepare_holdout_batches forces 0.0 so the holdout stays a fixed sample set.
+# It thresholds the 3-D NORM, which is why y's PER-AXIS zero mass survives it;
+# that is the known limit named at the top.
+#
+# STATE IS ON: 35 dims = 29 body joints + FK xyz of the MEASURED joints + FK xyz
+# of the COMMANDED joints. The third block is the chunk's own anchor. Safe to
+# serve since gr00t_obs_adapter calls PolicyNormProcessor.apply_state(), which
+# replays the training state transforms. SINGLE-FRAME (state_indices [0]), so
+# the HG-DAgger memoryless rule still holds.
+#
+# DATA: hil293 only (249 train / 44 eval episodes, the 15% episode holdout at
+# seed 1234), via g1-pipette-3view-hil293-eerel-{train,eval}. Rounds 6, 7 and 8
+# SHARE these dirs deliberately: the crops touch images only, so the action
+# statistics are identical and all three are action_mode "rel" -- they read the
+# same meta/stats_gr00t.json instead of invalidating each other's cache.
+#
+run_id: starvla_qwenoft_pipette_3view_hil293_eerel_state_crop3
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: jren313-georgia-institute-of-technology
+wandb_project: starVLA_unitree_g1_pipette
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenOFT
+  qwenvl:
+    base_vlm: /data/jren313/models/Qwen3-VL-4B-Instruct
+    attn_implementation: sdpa
+    # INERT on this backbone, kept only for family consistency. Only
+    # MiniCPM_V, CosmosGR00T_N1d7 and Gemma4 honour this key; the Qwen3-VL
+    # interface (modules/vlm/QWen3.py) never calls gradient_checkpointing_enable.
+    enable_gradient_checkpointing: true
+  action_model:
+    action_model_type: MLP
+    # == Pipette3ViewOFTEERelDataConfig.action_key_dims (right_ee_rel: 3).
+    action_dim: 3
+    # == sum(state_key_dims): 29 joints + 3 measured FK xyz + 3 commanded FK xyz.
+    state_dim: 35
+    action_horizon: 30
+    action_hidden_dim: 2560
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /home/jren313/Datasets
+    data_mix: unitree_g1_pipette_3view_oft_ee_rel_crop3_train_mix
+    # Held-out episodes, scored on fixed samples every eval_interval.
+    eval_data_mix: unitree_g1_pipette_3view_oft_ee_rel_crop3_eval_mix
+    # 3 ranks x 10 x 16 = 480 = indices [0, 480), a strict subset of round 7's
+    # [0, 512). See the holdout-comparability note in the header: with the
+    # default K=4 this run would have scored only [0, 192).
+    eval_num_batches: 10
+    # PINNED to 16, NOT following per_device_batch_size (21 this round), so the
+    # holdout index blocks stay 16-aligned with rounds 6 and 7.
+    eval_batch_size: 16
+    # Row 0 of this label is identically zero, so repeating it IS the
+    # physical hold-still baseline, in raw or normalised units alike.
+    eval_baseline: hold_first
+    expected_num_views: 3
+    lerobot_version: v2.0
+    action_type: abs_qpos
+    # THE action-space change. apply_keys/state_map are both required: without
+    # the map, _infer_state_key_for_action looks for state.right_ee_rel, does
+    # not find it, and _apply_action_mode SILENTLY SKIPS the subtraction
+    # (datasets.py:1332-1333), leaving absolute labels behind.
+    action_mode: rel
+    action_mode_apply_keys: ["action.right_ee_rel"]
+    action_mode_state_map:
+      action.right_ee_rel: state.right_ee_cmd
+    # Drop chunk anchors whose in-chunk commanded-hand motion is under this
+    # many millimetres. TRAIN MIXTURE ONLY (forced to 0.0 for the holdout in
+    # prepare_holdout_batches). See the header for why this is load-bearing.
+    pause_filter_mm: 1.0
+    pause_filter_key: action.right_ee_xyz
+    sequential_step_sampling: false
+    # 21 x accum 2 x 3 GPUs = 126. See the batch note in the header: 128 is not
+    # divisible by 3, and 126 preserves the step-to-epoch mapping (2,012.7
+    # steps/epoch vs round 7's 1,981.2) far better than 96 (2,641.6) would.
+    per_device_batch_size: 21
+    load_all_data_for_training: true
+    # post-crop size of every view (resize 270 -> crop 256 in the DataConfig)
+    obs_image_size: [256, 256]
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 8
+
+trainer:
+  # 10 epochs at batch 126: 253,594 / 126 = 2,012.7 steps/epoch, x10 = 20,127
+  # -> 20,100. Round 7 ran 19,800 = its own 10 epochs at batch 128. EPOCHS are
+  # matched, not steps -- the same rule that made round 6 vs round 3 controlled.
+  max_train_steps: 20100
+  num_warmup_steps: 600
+  # 1,000 not 2,000: round 7's valley was narrow (1,500-2,500) and its
+  # 2,000-step saves caught the minimum by luck. 20 saves x 9.1 GB = 182 GB of
+  # the 1.4 TB free on /data.
+  save_interval: 1000
+  eval_interval: 500
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  # 2, paired with per_device 21 on THREE ranks: 21 x 2 x 3 = 126. Round 7 used
+  # 16 x 1 x 8 = 128. Changing GPU count without re-deriving this pair is how a
+  # single-variable run silently becomes a two-variable one.
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt

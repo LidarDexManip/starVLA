@@ -1,0 +1,152 @@
+# QwenOFT ROUND 9, "ROUND 8's RECIPE, 8-D CHUNK-RELATIVE ACTION, hil293 + plus21"
+# (2026-09-15).
+#
+# WHAT CHANGES FROM ROUND 8 (starvla_qwenoft_pipette_3view_hil293_eerel_state_crop3):
+#
+#   1. ACTION 3 -> 8: right-wrist POSE (xyz + rotation vector) + right THUMB
+#      (thumb_bend, thumb_rot), all CHUNK-RELATIVE to the last COMMAND, exactly
+#      as round 8's xyz was:
+#          pos[i]   = FK_xyz(cmd[t+i]) - FK_xyz(cmd[t])          metres, pelvis
+#          rot[i]   = rotvec( R(cmd[t])^T  R(cmd[t+i]) )         body frame, rad
+#          thumb[i] = hand_right[t+i][4:6] - hand_right[t][4:6]  raw registers
+#      The rotation is the EXACT relative rotation, produced by the loader's new
+#      `action_mode_rotvec_dims` (datasets.py): an elementwise rotation-vector
+#      difference -- what plain `action_mode: rel` would do -- was measured on
+#      plus21 to be wrong by p50 0.30 / p99 2.2 / max 5.6 deg against relative
+#      rotations of p50 1.0 / p99 14 deg (scratchpad build_plus21_wrist8.py).
+#      Rotation vectors, not quaternions or RPY: 3 dims, no unit-norm
+#      constraint, no q == -q double cover, and the relative angles never come
+#      near the pi wrap (max 25 deg in a chunk; the absolute wrist angle tops
+#      out at 1.38 rad, 1.76 rad short of pi).
+#
+#   2. STATE 35 -> 43: 29 joints + measured wrist pose6 + COMMANDED wrist pose6
+#      + COMMANDED thumb2. The two commanded blocks are the chunk anchors, read
+#      through aliases of BYTE-COPY columns (action.right_wrist_cmd6,
+#      action.right_thumb_cmd). This fixes a flaw rounds 6-8 carried: their
+#      commanded-xyz state block aliased the LABEL column, whose statistics
+#      `action_mode: rel` overwrites with the REL q01/q99 (+-6.5 mm), so an
+#      absolute 0.2-0.3 m position was normalised to |value| ~ 20-50 and the
+#      discretised tokens saturated -- those 3 state dims were CONSTANT
+#      (verified in round 8's dataset_statistics.json: state dims 32:35 carry
+#      the rel span 13.3/10.4/6.9 mm, dims 29:32 the absolute 106/155/53 mm).
+#
+#   3. DATA: hil293 (249/44 eps, the shared seed-1234 split) POOLED WITH the
+#      full plus21 capture (78 eps: 66/12, eval = rounds 4/5's 8 held-out
+#      episodes of the first 53 + 4 of the 25 new). ONE union rel-mode q99 box
+#      written into all four -wrist8rel- dirs (scratchpad build_wrist8rel_r9.py);
+#      mixture weights = post-pause-filter anchor counts. The captures carry
+#      DIFFERENT task sentences (hil293 attaches only; plus21 attaches then
+#      ejects into the disposal box) and only plus21 works the thumb, so ~85%
+#      of thumb supervision is a held grip -- language disambiguates, as in
+#      round 5 (merged_wrist8).
+#
+# EVERYTHING ELSE IS ROUND 8 VERBATIM: three views with rgb centre 720 /
+# wrist_left centre 448 / wrist_right centre 720 -> resize 270 -> crop 256,
+# 95% random crop + 5 deg rotation + ColorJitter + colour temperature, 1.0 mm
+# pause filter on the commanded xyz (train only), state prompt on, 30-row
+# horizon, 21 x accum 2 x 3 GPUs = 126, the same learning rates and cosine
+# schedule, eval every 500 on the fixed holdout [0, 480) (K=10, B=16 on 3
+# ranks), save every 1000.
+#
+# STEP BUDGET: 10 epochs over the pooled post-filter anchors (hil293 253,594 +
+# plus21 see the launch log) at batch 126; MAX_TRAIN_STEPS is exported by the
+# launcher (the run script's own default beats this file).
+#
+# SERVING NEEDS BRIDGE WORK (not part of this round): rows are pose deltas
+# from the last COMMANDED wrist pose -- position added, rotation COMPOSED
+# (R_cmd @ R(rel)), thumb registers added to the last commanded thumb -- plus
+# a 43-dim state built the same way as this loader's.
+#
+run_id: starvla_qwenoft_pipette_3view_hil293plus21_wrist8rel_state_crop3
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: jren313-georgia-institute-of-technology
+wandb_project: starVLA_unitree_g1_pipette
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenOFT
+  qwenvl:
+    base_vlm: /data/jren313/models/Qwen3-VL-4B-Instruct
+    attn_implementation: sdpa
+    enable_gradient_checkpointing: true
+  action_model:
+    action_model_type: MLP
+    # == Pipette3ViewOFTWrist8RelCrop3DataConfig.action_key_dims: rel6 + thumb_rel2
+    action_dim: 8
+    # == sum(state_key_dims): 29 joints + 6 measured pose + 6 commanded pose + 2 commanded thumb
+    state_dim: 43
+    action_horizon: 30
+    action_hidden_dim: 2560
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /home/jren313/Datasets
+    data_mix: unitree_g1_pipette_3view_oft_wrist8_rel_crop3_train_mix
+    eval_data_mix: unitree_g1_pipette_3view_oft_wrist8_rel_crop3_eval_mix
+    # 3 ranks x 10 x 16 = 480 fixed holdout samples, drawn from the eval MIXTURE
+    # (hil293 : plus21 by eval frame counts), as in round 8.
+    eval_num_batches: 10
+    eval_batch_size: 16
+    # Row 0 of every rel label is identically zero (pose AND thumb), so
+    # repeating it is the physical hold-still baseline.
+    eval_baseline: hold_first
+    expected_num_views: 3
+    lerobot_version: v2.0
+    action_type: abs_qpos
+    # The action-space change. Both keys are anchored at their COMMANDED
+    # state alias (byte-copy columns, see the header); the pose key's dims
+    # [3, 6) are a rotation vector and get the exact relative rotation.
+    action_mode: rel
+    action_mode_apply_keys: ["action.right_wrist_rel6", "action.right_thumb_rel"]
+    action_mode_state_map:
+      action.right_wrist_rel6: state.right_wrist_cmd6
+      action.right_thumb_rel: state.right_thumb_cmd
+    action_mode_rotvec_dims:
+      action.right_wrist_rel6: [3, 6]
+    # 1.0 mm on the commanded wrist xyz (alias [0:3] of the pose column) --
+    # round 8's gate on the same physical quantity. TRAIN MIXTURE ONLY.
+    pause_filter_mm: 1.0
+    pause_filter_key: action.right_wrist_xyz
+    sequential_step_sampling: false
+    # 21 x accum 2 x 3 GPUs = 126, round 8's pair.
+    per_device_batch_size: 21
+    load_all_data_for_training: true
+    obs_image_size: [256, 256]
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 8
+
+trainer:
+  # 10 epochs at batch 126 over the pooled post-pause-filter anchors, measured
+  # by the round-9 smoke test: 253,594 (hil293) + 83,519 (plus21) = 337,113;
+  # 337,113 / 126 = 2,675.5 steps/epoch, x10 = 26,755 -> 26,800.
+  max_train_steps: 26800
+  num_warmup_steps: 600
+  save_interval: 1000
+  eval_interval: 500
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt
