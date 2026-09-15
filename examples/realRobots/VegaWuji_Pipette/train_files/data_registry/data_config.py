@@ -141,4 +141,32 @@ DATASET_NAMED_MIXTURES = {
     "vega_pipette_toS5_phase6_3v": [("rft_pipette_toS5_phase6", 1.0, "vega_wuji_pipette_3v")],
     "vega_pipette_toS5_phase6_3v_aug": [("rft_pipette_toS5_phase6", 1.0, "vega_wuji_pipette_3v_aug")],
     "vega_pipette_toS5_phase6ph_4v_aug": [("rft_pipette_toS5_phase6ph", 1.0, "vega_wuji_pipette_4v_phase_aug")],
+    # round 4: the same 128 scripted demos plus 17 DART recovery episodes (10 slide, 1 tube,
+    # 6 press). The press ones are the point: they are the only episodes in which the tip is
+    # off the tube opening at press time and the controller corrects before pressing.
+    "vega_pipette_toS5_phase6ph_r4_aug": [("rft_pipette_toS5_phase6ph_r4", 1.0, "vega_wuji_pipette_4v_phase_aug")],
+    # round 5: recovery data as its OWN dataset so its share is set by the weight, not by episode
+    # count (loader runs balance_dataset_weights=False -> 1.0/1.0 = half of all samples); the base's
+    # 128 scripted demos are near-duplicates, so more of them buys almost nothing.
+    # round 6c: fail-aware base + r5 recovery + today's p0/p4 runs.
+    # 50/50 base:recovery as in r5, so this round differs from r5 in CONTENT only.
+    # Base is full episodes only: salvaged p0/p1 prefixes were dropped because those
+    # phases are already solved and under phase_balanced_sampling they crowd out p2.
+    "vega_pipette_toS5_phase6ph_r6c_aug": [("rft_base_toS5_r6", 0.5, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r5", 0.355, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r6new", 0.145, "vega_wuji_pipette_4v_phase_aug")],
+    # round 7: closed-loop-slide demos + new p3 recovery + today's p0/p4 recovery, and the
+    # round-5 recovery set cut to 0.15 -- 42 of its 68 episodes carry an OPEN-LOOP phase-2
+    # segment, i.e. the behaviour this round replaces, under the same phase label.
+    "vega_pipette_toS5_phase6ph_r7_aug": [("rft_base_toS5_r7", 0.5, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r7p3", 0.2, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r6new", 0.15, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r5", 0.15, "vega_wuji_pipette_4v_phase_aug")],
+    # round 8: only this round's data.  The r5/r6new recovery sets carry an OPEN-LOOP
+    # phase-2 segment -- the 47-frame flick this round replaces -- under the same phase
+    # label, so including them would have the model see both slides at once.
+    "vega_pipette_toS5_phase6ph_r8_aug": [("rft_base_toS5_r8", 1.0, "vega_wuji_pipette_4v_phase_aug")],
+    "vega_pipette_toS5_phase6ph_r8b_aug": [("rft_base_toS5_r8_full", 0.5, "vega_wuji_pipette_4v_phase_aug"), ("rft_part_toS5_r8", 0.12, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r5", 0.25, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r6new", 0.13, "vega_wuji_pipette_4v_phase_aug")],
+    "vega_pipette_toS5_phase6ph_r11_aug": [("rft_base_r11", 0.3, "vega_wuji_pipette_4v_phase_aug"), ("rft_p3_r11", 0.14, "vega_wuji_pipette_4v_phase_aug"), ("rft_base_toS5_r8_full_nop3", 0.12, "vega_wuji_pipette_4v_phase_aug"), ("rft_part_toS5_r8_nop3", 0.1, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r5_nop3", 0.2, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r6new_nop3", 0.1, "vega_wuji_pipette_4v_phase_aug"), ("rft_handoff_r9", 0.04, "vega_wuji_pipette_4v_phase_aug")],  # r11: FETCH_EXTRACT=v2 teacher (slow straight-up escape) replaces the r10 teacher; continued from r10
+    "vega_pipette_toS5_phase6ph_r10_aug": [("rft_base_r10", 0.3, "vega_wuji_pipette_4v_phase_aug"), ("rft_p3_r10", 0.14, "vega_wuji_pipette_4v_phase_aug"), ("rft_base_toS5_r8_full_nop3", 0.12, "vega_wuji_pipette_4v_phase_aug"), ("rft_part_toS5_r8_nop3", 0.1, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r5_nop3", 0.2, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r6new_nop3", 0.1, "vega_wuji_pipette_4v_phase_aug"), ("rft_handoff_r9", 0.04, "vega_wuji_pipette_4v_phase_aug")],  # r10: v2 corner + lower grasp + TUBE_PHYS=v2 teacher
+    "vega_pipette_toS5_phase6ph_r9c_aug": [("rft_base_v2corner", 0.3, "vega_wuji_pipette_4v_phase_aug"), ("rft_p3_v2corner", 0.14, "vega_wuji_pipette_4v_phase_aug"), ("rft_base_toS5_r8_full_nop3", 0.12, "vega_wuji_pipette_4v_phase_aug"), ("rft_part_toS5_r8_nop3", 0.1, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r5_nop3", 0.2, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r6new_nop3", 0.1, "vega_wuji_pipette_4v_phase_aug"), ("rft_handoff_r9", 0.04, "vega_wuji_pipette_4v_phase_aug")],  # FETCH_CORNER=v2 is the only phase-3 teacher
+    "vega_pipette_toS5_phase6ph_r9b_aug": [("rft_base_toS5_r8_full", 0.425, "vega_wuji_pipette_4v_phase_aug"), ("rft_part_toS5_r8", 0.102, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r5", 0.2125, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r6new", 0.1105, "vega_wuji_pipette_4v_phase_aug"), ("rft_handoff_r9", 0.04, "vega_wuji_pipette_4v_phase_aug"), ("rft_p3rec_r9", 0.11, "vega_wuji_pipette_4v_phase_aug")],  # r8b ratios x0.85 + new data
+    "vega_pipette_toS5_phase6ph_r9_aug": [("rft_base_toS5_r8_full", 0.46, "vega_wuji_pipette_4v_phase_aug"), ("rft_part_toS5_r8", 0.08, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r5", 0.17, "vega_wuji_pipette_4v_phase_aug"), ("rft_dart_toS5_r6new", 0.08, "vega_wuji_pipette_4v_phase_aug"), ("rft_handoff_r9", 0.06, "vega_wuji_pipette_4v_phase_aug"), ("rft_p3rec_r9", 0.15, "vega_wuji_pipette_4v_phase_aug")],
+    "vega_pipette_toS5_phase6ph_r5_aug": [("rft_pipette_toS5_phase6ph", 1.0, "vega_wuji_pipette_4v_phase_aug"),
+                                          ("rft_dart_toS5_r5", 1.0, "vega_wuji_pipette_4v_phase_aug")],
 }

@@ -1,0 +1,103 @@
+# RUN 5: fine-tune from r4 on base + 45 recovery episodes at weight 1:1, wrist joints exempt
+# from state dropout.
+# Everything else is inherited from RUN 3/4 (six phase sub-instructions, 16-dim phase one-hot in
+# the state, phase-balanced step sampling, photometric augmentation, all four cameras).
+# Two changes vs r4, both from the round-4 handoff-contract audit (S1 9/10 milestones but only
+# 3/10 delivered a grasp the next phase can use; the wrist yaw at grasp scattered over 6-88 deg):
+#   1. DATA: the 45 DART recovery episodes are their own dataset entry at weight 1.0 against the
+#      base's 1.0, so recovery is HALF of all sampled frames (the loader runs with
+#      balance_dataset_weights=False, so the weight is the share). Episode counts do not matter:
+#      the 128 scripted demos are near-duplicates of each other.
+#   2. STATE: framework.state_dropout_keep_ranges exempts the two wrist joint blocks from state
+#      dropout. The grasp yaw is readable from the wrist joints but not from vision -- the pipette
+#      is a plain cylinder, so rotating it about its own axis does not change the images.
+# Fine-tune, not from scratch: 5000 steps off the r4 final weights at half the r4 learning rates.
+# 54-D absolute joint targets, 30-step chunks @ 30 Hz. Node paths (/data/hding95).
+
+run_id: egovla_vega_toS5_phase6ph_r9c_ft
+run_root_dir: /data/hding95/ckpts
+output_dir: /data/hding95/ckpts/egovla_vega_toS5_phase6ph_r9c_ft
+seed: 42
+is_debug: false
+
+framework:
+  name: EgoVLA
+  qwenvl:
+    base_vlm: /data/hding95/ckpts/ego_vla_checkpoint/ckpt-6720
+    attn_implementation: sdpa
+    use_bf16: true
+    enable_gradient_checkpointing: true
+  # pi0.5-style state dropout: with prob p the (continuous) state fed to the FM head is zeroed
+  state_dropout_prob: 0.8
+  state_dropout_keep_dims: 16   # the phase one-hot (state dims 54..69) is never dropped
+  # left wrist joint (state 4:7) and right wrist joint (state 27+4 : 27+7 = 31:34) are also
+  # never dropped: the grasp yaw lives there and is invisible in the images (round-5 change)
+  state_dropout_keep_ranges: [[4, 7], [31, 34]]
+  grasp_loss_weight: 1.0
+  false_press_penalty: 0.0
+  overreach_alpha: 0.0
+  reach_motion_weight: 1.0
+  action_model:
+    action_model_type: DiT-B        # flow-matching head (GR00T-style), cross-attends the VILA tokens
+    action_dim: 54
+    state_dim: 70
+    action_horizon: 30
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    repeated_diffusion_steps: 4
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+  input_placeholder_end_token_idx: 151195
+  input_placeholder_start_token_idx: 151375
+  action_query_token_id: 151300
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /data/hding95/datasets
+    data_mix: vega_pipette_toS5_phase6ph_r9c_aug
+    phase_balanced_sampling: true
+    include_state: true
+    action_mode: abs
+    obs_image_size: [384, 384]
+    per_device_batch_size: 12  # r9c on 2 cards (GPUs 6/7 taken): 2 x 12 = 24 = r8b
+    num_workers: 8
+    video_backend: decord
+    delete_pause_frame: false
+
+trainer:
+  # fine-tune off the r4 final weights (full-model state dict; reload_modules unset -> full load)
+  pretrained_checkpoint: /data/hding95/ckpts/egovla_vega_toS5_phase6ph_r4_fm/final_model/pytorch_model.pt
+  max_train_steps: 15000   # r9c: user asked for longer training (5000 steps = 35 min on 4 cards)
+  num_warmup_steps: 100
+  save_interval: 1000
+  eval_interval: 500
+  logging_frequency: 10
+  learning_rate:
+    base: 2.5e-05          # all three halved vs r4: this is a fine-tune
+    vlm: 1.0e-05
+    action_model: 5.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  gradient_clipping: 1.0
+  freeze_modules: ''
+  is_resume: false
+  save_format: pt
+  optimizer:
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
