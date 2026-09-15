@@ -277,11 +277,15 @@ class PolicyNormProcessor:
             ``config.yaml`` and ``dataset_statistics.json`` two dirs up).
         unnorm_key: Which top-level key in ``dataset_statistics.json`` to use.
             ``None`` → auto-pick the only key.
+        config_path: Optional full configuration, overriding the run's config.yaml.
     """
 
-    def __init__(self, ckpt_path: str, unnorm_key: Optional[str] = None) -> None:
+    def __init__(
+        self, ckpt_path: str, unnorm_key: Optional[str] = None,
+        config_path: Optional[str] = None,
+    ) -> None:
         self._ckpt_path = str(ckpt_path)
-        cfg, norm_stats = read_mode_config(self._ckpt_path)
+        cfg, norm_stats = read_mode_config(self._ckpt_path, config_path=config_path)
         self._model_cfg = cfg
         self._norm_stats = norm_stats
 

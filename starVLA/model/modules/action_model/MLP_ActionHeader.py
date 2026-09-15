@@ -80,6 +80,8 @@ class L1RegressionActionHead(nn.Module):
         """
         batch_size, chunk_len, hidden_dim = actions_hidden_states.shape
         x = actions_hidden_states.reshape(batch_size * chunk_len, hidden_dim)
+        # The VLM may emit bf16 while the trainable action head stays fp32.
+        x = x.to(dtype=self.model.fc1.weight.dtype)
         x = self.model(x)  # (B * chunk_len, action_dim)
         actions = x.view(batch_size, chunk_len, self.action_dim)
         return actions

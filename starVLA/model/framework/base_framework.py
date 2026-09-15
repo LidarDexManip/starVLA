@@ -220,7 +220,8 @@ class baseframework(PreTrainedModel):
 
         Args:
             pretrained_checkpoint: Path to .pt file inside run/checkpoints directory.
-            **kwargs: Extra constructor overrides passed to subclass.
+            **kwargs: ``config_path`` optionally selects a full configuration
+                instead of the run directory's config.yaml.
 
         Returns:
             baseframework: Instantiated model (left on CPU; caller decides device).
@@ -230,7 +231,9 @@ class baseframework(PreTrainedModel):
             FileNotFoundError: If underlying files are missing (surfaced earlier).
         """
         pretrained_checkpoint = Path(pretrained_checkpoint)
-        model_config, norm_stats = read_mode_config(pretrained_checkpoint)  # read config and norm_stats
+        model_config, norm_stats = read_mode_config(
+            pretrained_checkpoint, config_path=kwargs.pop("config_path", None)
+        )
 
         config = dict_to_namespace(model_config)
         model_config = config
@@ -266,4 +269,3 @@ class baseframework(PreTrainedModel):
         # **ensure model is on GPU**
         FrameworkModel = FrameworkModel
         return FrameworkModel
-

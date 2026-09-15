@@ -354,12 +354,14 @@ def read_model_config(pretrained_checkpoint):
     return global_cfg, norm_stats
 
 
-def read_mode_config(pretrained_checkpoint):
+def read_mode_config(pretrained_checkpoint, config_path=None):
     """
     Same as read_model_config (legacy duplicate kept for backward compatibility).
 
     Args:
         pretrained_checkpoint: Path to a .pt checkpoint file.
+        config_path: Optional explicit full configuration; statistics still
+            come from the checkpoint's run directory.
 
     Returns:
         tuple:
@@ -376,6 +378,8 @@ def read_mode_config(pretrained_checkpoint):
 
         # Get paths for `config.json`, `dataset_statistics.json` and pretrained checkpoint
         config_yaml, dataset_statistics_json = run_dir / "config.yaml", run_dir / "dataset_statistics.json"
+        if config_path is not None:
+            config_yaml = Path(config_path)
         assert config_yaml.exists(), f"Missing `config.yaml` for `{run_dir = }`"
         assert dataset_statistics_json.exists(), f"Missing `dataset_statistics.json` for `{run_dir = }`"
 
