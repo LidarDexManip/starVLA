@@ -160,12 +160,112 @@ def _normalize_action_mode_state_map(action_mode_state_map: dict[str, str] | Non
     return normalized
 
 
+def _normalize_action_mode_rotvec_dims(action_mode_rotvec_dims) -> dict[str, tuple[int, int]]:
+    """{action key: [start, end)} of the ROTATION-VECTOR dims inside that key.
+
+    Round 9 (2026-09-15). Under ``action_mode: rel`` those dims get the exact
+    body-frame relative rotation ``rotvec(R(anchor)^T R(a_i))`` instead of the
+    elementwise difference ``a_i - anchor``, which is only a first-order
+    approximation and was measured on g1-pipette-3view-20260819-plus21 to be
+    off by p50 0.30 deg / p99 2.2 deg / max 5.6 deg against relative rotations
+    of p50 1.0 deg / p99 14 deg (scratchpad build_plus21_wrist8.py). Position
+    dims and every other key keep the elementwise rule.
+    """
+    out: dict[str, tuple[int, int]] = {}
+    for key, dims in (action_mode_rotvec_dims or {}).items():
+        key = str(key)
+        if not key.startswith("action."):
+            key = f"action.{key}"
+        dims = list(dims)
+        if len(dims) != 2:
+            raise ValueError(f"action_mode_rotvec_dims[{key}] must be [start, end), got {dims}")
+        s, e = int(dims[0]), int(dims[1])
+        if e - s != 3 or s < 0:
+            raise ValueError(f"action_mode_rotvec_dims[{key}] must be a 3-wide slice, got [{s}, {e})")
+        out[key] = (s, e)
+    return out
+
+
+def _rotvec_to_matrix(v: np.ndarray) -> np.ndarray:
+    """(N, 3) rotation vectors -> (N, 3, 3) matrices (Rodrigues)."""
+    v = np.asarray(v, dtype=np.float64).reshape(-1, 3)
+    th = np.linalg.norm(v, axis=1)
+    k = np.zeros_like(v)
+    ok = th > 1e-12
+    k[ok] = v[ok] / th[ok, None]
+    K = np.zeros((len(v), 3, 3))
+    K[:, 0, 1], K[:, 0, 2] = -k[:, 2], k[:, 1]
+    K[:, 1, 0], K[:, 1, 2] = k[:, 2], -k[:, 0]
+    K[:, 2, 0], K[:, 2, 1] = -k[:, 1], k[:, 0]
+    c, s = np.cos(th)[:, None, None], np.sin(th)[:, None, None]
+    return np.eye(3)[None] + s * K + (1.0 - c) * (K @ K)
+
+
+def _matrix_to_rotvec(R: np.ndarray) -> np.ndarray:
+    """(N, 3, 3) -> (N, 3) rotation vectors, well-conditioned for small angles
+    (atan2 form) and defined at the pi wrap (axis from the symmetric part)."""
+    R = np.asarray(R, dtype=np.float64).reshape(-1, 3, 3)
+    ax = np.stack([R[:, 2, 1] - R[:, 1, 2], R[:, 0, 2] - R[:, 2, 0], R[:, 1, 0] - R[:, 0, 1]], axis=1)
+    sin_th = 0.5 * np.linalg.norm(ax, axis=1)
+    cos_th = 0.5 * (np.trace(R, axis1=1, axis2=2) - 1.0)
+    th = np.arctan2(sin_th, np.clip(cos_th, -1.0, 1.0))
+    out = np.zeros_like(ax)
+    small = th < 1e-6
+    out[small] = 0.5 * ax[small]                       # k*theta ~= ax/2 as theta -> 0
+    mid = (~small) & (th < np.pi - 1e-3)
+    out[mid] = ax[mid] * (th[mid] / (2.0 * sin_th[mid]))[:, None]
+    big = ~(small | mid)
+    if big.any():
+        # Symmetric part: S = I + (1 - cos th) K^2 and K^2 = k k^T - I, so
+        # k k^T = I + (S - I) / (1 - cos th)  -- well conditioned near pi.
+        Rb = R[big]
+        S = 0.5 * (Rb + np.transpose(Rb, (0, 2, 1)))
+        kk = np.eye(3)[None] + (S - np.eye(3)[None]) / (1.0 - cos_th[big])[:, None, None]
+        idx = np.argmax(np.stack([kk[:, 0, 0], kk[:, 1, 1], kk[:, 2, 2]], axis=1), axis=1)
+        k = kk[np.arange(len(kk)), :, idx]
+        k = k / np.maximum(np.linalg.norm(k, axis=1, keepdims=True), 1e-12)
+        flip = np.einsum("ni,ni->n", k, ax[big]) < 0.0   # sign from 2 sin(theta) k (arbitrary at exactly pi)
+        k[flip] *= -1.0
+        out[big] = k * th[big][:, None]
+    return out
+
+
+def _relative_rotvec(anchor: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Body-frame relative rotation of every row of ``v`` (N, 3) w.r.t. ``anchor`` (3,):
+    ``rotvec(R(anchor)^T @ R(v_i))``, so that ``R(v_i) = R(anchor) @ R(rel_i)``."""
+    v = np.asarray(v)
+    R0 = _rotvec_to_matrix(np.asarray(anchor, dtype=np.float64).reshape(1, 3))[0]
+    R = _rotvec_to_matrix(v)
+    rel = np.einsum("ji,njk->nik", R0, R)              # R0^T @ R_n
+    return _matrix_to_rotvec(rel).astype(v.dtype, copy=False)
+
+
+def _resolve_rotvec_col_slices(lerobot_modality_meta, action_mode_rotvec_dims) -> dict:
+    """(action column, (col start, col end)) -> (local start, local end) of the
+    rotation-vector dims, in the layout _get_action_col_slices uses."""
+    out = {}
+    for key, (s, e) in (action_mode_rotvec_dims or {}).items():
+        sub = key.replace("action.", "", 1)
+        cfg = lerobot_modality_meta.action[sub]
+        col = cfg.original_key or sub
+        width = cfg.end - cfg.start
+        if not (0 <= s < e <= width):
+            raise ValueError(f"action_mode_rotvec_dims[{key}] = [{s}, {e}) exceeds the key width {width}")
+        out[(col, (cfg.start, cfg.end))] = (s, e)
+    return out
+
+
 def _build_stats_cache_config(
     action_mode: str,
+    action_mode_rotvec_dims: dict | None = None,
 ) -> dict:
-    return {
+    cfg = {
         "mode": action_mode,
     }
+    # Only present when used, so every pre-existing {"mode": ...} cache stays valid.
+    if action_mode_rotvec_dims:
+        cfg["rotvec_dims"] = {k: [int(s), int(e)] for k, (s, e) in sorted(action_mode_rotvec_dims.items())}
+    return cfg
 
 
 def _invalidate_legacy_stats_cache(stats_path: Path, reason: str) -> None:
@@ -237,6 +337,7 @@ def _compute_statistics_for_mode(
     state_indices: list[int] | None,
     action_mode_apply_keys: list[str] | None,
     action_mode_state_map: dict[str, str] | None,
+    action_mode_rotvec_dims: dict | None = None,
 ) -> dict:
     if int(os.environ.get("RANK", "0")) == 0:
         print(f"[RANK 0] Calculating dataset statistics for {dataset_name} (mode={action_mode})")
@@ -275,6 +376,7 @@ def _compute_statistics_for_mode(
             action_mode_apply_keys=action_mode_apply_keys,
             action_mode_state_map=action_mode_state_map,
             base_stats=base_stats,
+            action_mode_rotvec_dims=action_mode_rotvec_dims,
         )
     raise ValueError(f"Unsupported action mode for statistics: {action_mode}")
 
@@ -292,6 +394,7 @@ def _load_or_compute_statistics(
     state_indices: list[int] | None,
     action_mode_apply_keys: list[str] | None,
     action_mode_state_map: dict[str, str] | None,
+    action_mode_rotvec_dims: dict | None = None,
 ) -> dict:
     le_statistics = _load_stats_cache(
         stats_path,
@@ -312,6 +415,7 @@ def _load_or_compute_statistics(
         state_indices=state_indices,
         action_mode_apply_keys=action_mode_apply_keys,
         action_mode_state_map=action_mode_state_map,
+        action_mode_rotvec_dims=action_mode_rotvec_dims,
     )
     _save_stats_cache(stats_path, stats_cache_config, le_statistics)
     return le_statistics
@@ -471,12 +575,15 @@ def calculate_rel_action_statistics(
     action_mode_apply_keys: list[str] | None = None,
     action_mode_state_map: dict[str, str] | None = None,
     base_stats: dict | None = None,
+    action_mode_rotvec_dims: dict | None = None,
 ) -> dict:
     """
     Calculate action statistics using rel mode.
 
     Rule:
       - For all t: a_t - s_0
+      - dims named in action_mode_rotvec_dims: rotvec(R(s_0)^T R(a_t)) instead
+        (exact body-frame relative rotation; see _normalize_action_mode_rotvec_dims)
 
     Mapping rule (only two cases):
       1) Use explicit action_mode_state_map if provided.
@@ -490,6 +597,7 @@ def calculate_rel_action_statistics(
     )
     if not action_col_slices:
         raise ValueError("No action columns found in the dataset.")
+    rotvec_local = _resolve_rotvec_col_slices(lerobot_modality_meta, action_mode_rotvec_dims)
 
     def _get_chunk(array: np.ndarray, step_indices: np.ndarray, padding_strategy: str) -> np.ndarray:
         max_length = array.shape[0]
@@ -536,6 +644,10 @@ def calculate_rel_action_statistics(
                         raise ValueError(f"Action/state dim mismatch for {action_col}:{a_slice}")
 
                     out = action_part_chunk - state_chunk[0]
+                    rv = rotvec_local.get((action_col, tuple(a_slice)))
+                    if rv is not None:
+                        ls, le = rv
+                        out[:, ls:le] = _relative_rotvec(state_chunk[0][ls:le], action_part_chunk[:, ls:le])
                     action_chunk_full[:, a_slice[0] : a_slice[1]] = out
 
                 accum[action_col].append(action_chunk_full)
@@ -655,6 +767,7 @@ class LeRobotSingleDataset(Dataset):
         self._action_mode = None
         self._action_mode_state_map = {}
         self._action_mode_apply_keys = None
+        self._action_mode_rotvec_dims = {}
 
         self.delete_pause_frame = delete_pause_frame
 
@@ -932,8 +1045,12 @@ class LeRobotSingleDataset(Dataset):
         normalized_state_map = _normalize_action_mode_state_map(
             self.data_cfg.get("action_mode_state_map", {}) if self.data_cfg else {}
         )
+        rotvec_dims = _normalize_action_mode_rotvec_dims(
+            self.data_cfg.get("action_mode_rotvec_dims", None) if self.data_cfg else None
+        )
         stats_cache_config = _build_stats_cache_config(
             action_mode=action_mode,
+            action_mode_rotvec_dims=rotvec_dims,
         )
         parquet_files = list(self.dataset_path.glob(LE_ROBOT_DATA_FILENAME))
         parquet_files_filtered = [
@@ -954,6 +1071,7 @@ class LeRobotSingleDataset(Dataset):
                 state_indices=state_indices,
                 action_mode_apply_keys=apply_keys,
                 action_mode_state_map=normalized_state_map,
+                action_mode_rotvec_dims=rotvec_dims,
             )
         else:
             le_statistics = None
@@ -1426,6 +1544,14 @@ class LeRobotSingleDataset(Dataset):
         self._action_mode_state_map = _normalize_action_mode_state_map(
             self.data_cfg.get("action_mode_state_map", {}) or {}
         )
+        self._action_mode_rotvec_dims = _normalize_action_mode_rotvec_dims(
+            self.data_cfg.get("action_mode_rotvec_dims", None) or {}
+        )
+        if self._action_mode_rotvec_dims and action_mode != "rel":
+            raise ValueError(
+                "action_mode_rotvec_dims is only implemented for action_mode: rel "
+                f"(got {action_mode!r})"
+            )
 
     def _infer_state_key_for_action(self, action_key: str) -> str | None:
         if action_key in self._action_mode_state_map:
@@ -1472,6 +1598,11 @@ class LeRobotSingleDataset(Dataset):
                 out[0] = action_values[0] - state0
             elif self._action_mode == "rel":
                 out = action_values - state0
+                rv = self._action_mode_rotvec_dims.get(action_key)
+                if rv is not None:
+                    # exact body-frame relative rotation for the rotation-vector dims
+                    s, e = rv
+                    out[:, s:e] = _relative_rotvec(state0[s:e], action_values[:, s:e])
             else:
                 out = action_values
 

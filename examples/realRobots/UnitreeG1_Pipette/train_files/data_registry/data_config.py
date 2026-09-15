@@ -1374,6 +1374,137 @@ class Pipette3ViewOFTEERelCropDataConfig(Pipette3ViewOFTEERelDataConfig):
         return ComposedModalityTransform(transforms=t)
 
 
+class Pipette3ViewOFTEERelCrop3DataConfig(Pipette3ViewOFTEERelCropDataConfig):
+    """Round 8: round 7 with wrist_right ALSO centre-cropped, 1080 -> 720.
+
+    SINGLE VARIABLE AGAINST ROUND 7. rgb (centre 720 of 1280x720) and
+    wrist_left (centre 448 of 1080) are inherited untouched, as are the action
+    space, state block, pause filter, dataset and horizon. The one change:
+
+        video.wrist_right   1080x1080 -> centre 720x720 -> 270 -> 256
+                            scale 0.237 -> 0.356,  tip 5.3 -> 7.6 px (1.42x)
+
+    WHY 720 AND NOT 448. Two separate measurements, pulling the same way.
+    (a) A gray-frame ablation of round 7 @ steps_2000 on 96 holdout chunks
+        showed wrist_right had gone IDLE -- blanking it moved x +4%, z -1%,
+        and y -6% (i.e. slightly better without it) -- while wrist_left
+        carried everything (blanking it: y +18%, z +107%). Round 7's crops
+        moved all the reliance onto one view, which is also the one whose
+        448 box loses the tip in ~6% of frames. Giving wrist_right real
+        resolution is meant to restore a second, INDEPENDENT source for the
+        same evidence rather than to add y sensitivity it cannot have.
+    (b) wrist_right is the best "WHICH well" view -- fixed, top-down, the
+        rack centred and static in frame -- and at 720 the whole rack plus
+        the pipette and the green tip stay inside the box for the entire
+        approach, at 1.42x the magnification. At 448 the rack's edges leave
+        the frame, which is exactly the context the task's one cue (the
+        single well holding a tip) needs.
+
+    WHAT THIS CANNOT DO, stated so the result is read correctly:
+    wrist_right's y sensitivity is ~0.01 px/mm (y runs down its optical
+    axis); 1.42x magnification leaves it ~0.014. This crop cannot let the
+    model watch itself move in y. What it can do is make the TARGET's
+    identity easier to read, which combined with state (the commanded hand
+    pose, already in the 35-dim vector) is a different route to the same
+    number. The L1-median / per-axis zero-mass mechanism that keeps y's aim
+    slope at 0.18 is untouched here too -- that is the loss-side fix, kept
+    out of this round to preserve the single variable.
+
+    SERVING NEEDS NO NEW BRIDGE CODE: "wrist_right": "center:720" is an
+    already-implemented view_crop mode (rounds 12/13 use center:N), and
+    centre-of-a-centred-square is the centre, so the one mode is correct for
+    both the stored 1080x1080 mp4s and the live 1920x1080 stream.
+
+    DATASET SHARED WITH ROUNDS 6 AND 7 for the same reason as round 7: the
+    crop touches images only, the action/state statistics are identical, and
+    the stats cache key is {"mode": "rel"} for all three. Registered as
+    ``unitree_g1_pipette_3view_oft_ee_rel_crop3`` ("3" = all three views now
+    carry a centre crop).
+    """
+
+    WRIST_RIGHT_KEY = ["video.wrist_right"]
+    WRIST_RIGHT_CROP = 720   # 1080x1080 -> centred 720
+
+    def transform(self):
+        composed = super().transform()      # round 7's rgb + wrist_left crops
+        t = _insert_centre_crop(composed.transforms, self.WRIST_RIGHT_KEY,
+                                self.WRIST_RIGHT_CROP, replace_resize=False)
+        return ComposedModalityTransform(transforms=t)
+
+
+class Pipette3ViewOFTWrist8RelCrop3DataConfig(Pipette3ViewOFTEERelCrop3DataConfig):
+    """Round 9 (2026-09-15): round 8's recipe with an 8-D CHUNK-RELATIVE action
+    (6-D wrist pose + 2-D thumb) on hil293 POOLED WITH the plus21 capture.
+
+    Views, crops (rgb 720 / wrist_left 448 / wrist_right 720 -> 270 -> 256),
+    augmentation, horizon, pause filter and the discretised-state prompt are
+    round 8's, inherited unchanged. What changes:
+
+    ACTION  action.right_wrist_rel6 (6) + action.right_thumb_rel (2) = 8.
+        pose: rel[i] = pose(cmd[t+i]) (-) pose(cmd[t]) with the position part
+              subtracted (metres, pelvis frame, as round 8) and the rotation
+              part the EXACT body-frame relative rotation
+              rotvec(R_cmd[t]^T R_cmd[t+i]) -- NOT an elementwise rotation-
+              vector difference, which was measured on plus21 to be wrong by
+              p50 0.30 deg / p99 2.2 deg / max 5.6 deg against relative
+              rotations of p50 1.0 deg / p99 14 deg (scratchpad
+              build_plus21_wrist8.py). The loader does this through
+              `action_mode_rotvec_dims` (datasets.py, round-9 patch), in the
+              label AND in the q99 statistics.
+        thumb: rel[i] = hand_right[t+i][4:6] - hand_right[t][4:6], raw Inspire
+              registers, anchored at the last COMMANDED thumb like the pose.
+        Registered under its own name so the serve-time config resolves.
+
+    STATE  43 dims = 29 body joints + measured wrist pose6 + COMMANDED wrist
+        pose6 + COMMANDED thumb2. The two commanded blocks are the chunk's own
+        anchors, read through aliases of BYTE-COPY columns
+        (action.right_wrist_cmd6, action.right_thumb_cmd), never of the label
+        columns: `action_mode: rel` overwrites the statistics of the column it
+        is applied to, and rounds 6-8 read their commanded-xyz state block
+        through such a shared column -- its three state dims were normalised
+        with the +-6.5 mm REL span and saturated to a constant (verified in
+        round 8's dataset_statistics.json). Round 9 keeps them absolute.
+
+    DATA  hil293-wrist8rel-{train,eval} (249/44 eps, the seed-1234 split every
+        OFT round shares) + 20260819-plus21-wrist8rel-{train,eval} (66/12 eps:
+        the 8 episodes rounds 4/5 held out of the first 53, plus 4 of the 25
+        new ones). ONE union rel-mode statistics file is written into all four
+        dirs (scratchpad build_wrist8rel_r9.py) so both halves share a q99 box;
+        mixture weights are the post-pause-filter anchor counts. The two
+        captures carry DIFFERENT task sentences (hil293: attach only; plus21:
+        attach then eject into the disposal box) and the thumb only works in
+        the latter -- language is what disambiguates them, as in round 5.
+    """
+
+    state_keys = [
+        "state.left_leg",
+        "state.right_leg",
+        "state.waist",
+        "state.left_arm",
+        "state.right_arm",
+        "state.right_wrist_pose6",   # FK(measured), absolute
+        "state.right_wrist_cmd6",    # FK(commanded) = the pose anchor, absolute
+        "state.right_thumb_cmd",     # commanded thumb = the thumb anchor
+    ]
+    state_key_dims = {
+        "state.left_leg": 6,
+        "state.right_leg": 6,
+        "state.waist": 3,
+        "state.left_arm": 7,
+        "state.right_arm": 7,
+        "state.right_wrist_pose6": 6,
+        "state.right_wrist_cmd6": 6,
+        "state.right_thumb_cmd": 2,
+    }
+
+    action_keys = ["action.right_wrist_rel6", "action.right_thumb_rel"]
+    action_key_dims = {"action.right_wrist_rel6": 6, "action.right_thumb_rel": 2}
+    action_normalization_modes = {
+        "action.right_wrist_rel6": "q99",
+        "action.right_thumb_rel": "q99",
+    }
+
+
 ROBOT_TYPE_CONFIG_MAP = {
     "unitree_g1_pipette_n1d7": PipetteTipG1GR00TN1d7DataConfig(),
     "unitree_g1_pipette_armhand_n1d7": PipetteTipG1ArmHandOnlyDataConfig(),
@@ -1413,6 +1544,15 @@ ROBOT_TYPE_CONFIG_MAP = {
     # dataset, same token count -- only how many native pixels reach the tip.
     "unitree_g1_pipette_3view_oft_ee_rel_crop":
         Pipette3ViewOFTEERelCropDataConfig(),
+    # Round 8: round 7 plus wrist_right centre-cropped 1080 -> 720. Same
+    # action space and dataset again; the single variable is that the view
+    # round 7's own ablation found IDLE now gets 1.42x the resolution.
+    "unitree_g1_pipette_3view_oft_ee_rel_crop3":
+        Pipette3ViewOFTEERelCrop3DataConfig(),
+    # Round 9 (2026-09-15): round 8's views/crops/state prompt with an 8-D
+    # chunk-relative action (wrist pose6 + thumb2) on hil293 + plus21.
+    "unitree_g1_pipette_3view_oft_wrist8_rel_crop3":
+        Pipette3ViewOFTWrist8RelCrop3DataConfig(),
     # Round 12: round 11 with the wrist views centre-cropped 1080 -> 720
     # BEFORE the 448 resize. Same three views, same token count.
     "unitree_g1_pipette_3view_nohist_crop720_n1d7":
@@ -1682,8 +1822,43 @@ DATASET_NAMED_MIXTURES = {
         ("g1-pipette-3view-hil293-eerel-eval", 1.0,
          "unitree_g1_pipette_3view_oft_ee_rel_crop"),
     ],
+    # Round 8 shares the dirs with rounds 6 and 7 for the same reason: its
+    # crop is images-only, so the stats (and the {"mode": "rel"} cache key)
+    # are identical and nothing is invalidated.
+    "unitree_g1_pipette_3view_oft_ee_rel_crop3_train_mix": [
+        ("g1-pipette-3view-hil293-eerel-train", 1.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+    ],
+    "unitree_g1_pipette_3view_oft_ee_rel_crop3_eval_mix": [
+        ("g1-pipette-3view-hil293-eerel-eval", 1.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+    ],
     "unitree_g1_pipette_3view_oft_ee_eval_mix": [
         ("g1-pipette-3view-hil293-ee-eval", 1.0, "unitree_g1_pipette_3view_oft_ee"),
+    ],
+    # ROUND 9 (2026-09-15): hil293 + plus21 under ONE 8-D chunk-relative action
+    # space and ONE union q99 box (scratchpad build_wrist8rel_r9.py writes the
+    # same rel-mode stats_gr00t.json into all four dirs). SEPARATE -wrist8rel-
+    # dirs, not the -wrist8 ones: the stats cache key is {"mode": action_mode},
+    # and rounds 4/5 still need the abs cache in the -wrist8 dirs intact.
+    # WEIGHTS ARE POST-PAUSE-FILTER ANCHOR COUNTS (train) / frame counts (eval):
+    # LeRobotMixtureDataset.sample_step draws the DATASET by these weights, so
+    # they must be the natural pooled proportions, not 1.0/1.0.
+    "unitree_g1_pipette_3view_oft_wrist8_rel_crop3_train_mix": [
+        ("g1-pipette-3view-hil293-wrist8rel-train", 253594.0,
+         "unitree_g1_pipette_3view_oft_wrist8_rel_crop3"),
+        # 83,519 of 87,641 frames survive the 1.0 mm pause filter (95.30%,
+        # measured by the round-9 smoke test); hil293's 253,594 is round 8's
+        # exact count, which also cross-checks that wrist8's pose xyz equals
+        # the -ee columns bit-for-bit.
+        ("g1-pipette-3view-20260819-plus21-wrist8rel-train", 83519.0,
+         "unitree_g1_pipette_3view_oft_wrist8_rel_crop3"),
+    ],
+    "unitree_g1_pipette_3view_oft_wrist8_rel_crop3_eval_mix": [
+        ("g1-pipette-3view-hil293-wrist8rel-eval", 56115.0,
+         "unitree_g1_pipette_3view_oft_wrist8_rel_crop3"),
+        ("g1-pipette-3view-20260819-plus21-wrist8rel-eval", 14833.0,
+         "unitree_g1_pipette_3view_oft_wrist8_rel_crop3"),
     ],
     # PURE-HIL arm of the R15 A/B: ONLY the 46 HG-DAgger correction
     # episodes (eps 78-123 of the merged R15 set, re-extracted to their
