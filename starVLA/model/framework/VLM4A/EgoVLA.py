@@ -260,6 +260,30 @@ class EgoVLA(baseframework):
         return torch.tensor(np.array([np.asarray(e["state"]) for e in examples]),
                             device=device, dtype=dtype)
 
+    def _state_dropout_protect_mask(self, s):
+        """(1, 1, state_dim) mask of the state dims that survive in a DROPPED row, or None when
+        nothing is protected (then state dropout zeroes the whole row, as before).
+        Protected = the `state_dropout_keep_dims` trailing dims plus every [start, end) pair in
+        `state_dropout_keep_ranges`. Built once per (state width, device, dtype) and cached."""
+        d = s.shape[-1]
+        kd = int(self.config.framework.get("state_dropout_keep_dims", 0))
+        ranges = self.config.framework.get("state_dropout_keep_ranges", None) or []
+        if kd <= 0 and len(ranges) == 0:
+            return None
+        cache = getattr(self, "_sd_protect_cache", None)
+        if cache is None:
+            cache = self._sd_protect_cache = {}
+        key = (d, str(s.device), str(s.dtype))
+        m = cache.get(key)
+        if m is None:
+            m = torch.zeros(1, 1, d, device=s.device, dtype=s.dtype)
+            if kd > 0:
+                m[..., d - kd:] = 1.0
+            for lo, hi in ranges:
+                m[..., int(lo):int(hi)] = 1.0
+            cache[key] = m
+        return m
+
     def _run(self, examples):
         """Shared pipeline: backbone -> action-query latent -> traj decoder pred."""
         input_ids, attn, labels, images, proprio = self._build_inputs(examples)
@@ -304,11 +328,18 @@ class EgoVLA(baseframework):
                     # `state_dropout_keep_dims` trailing dims are NEVER dropped: they carry the
                     # phase one-hot (a hard task-stage signal the policy must always see), while
                     # the proprioceptive dims in front are still dropped to prevent copycat.
-                    kd = int(self.config.framework.get("state_dropout_keep_dims", 0))
-                    if kd > 0:
-                        s = torch.cat([s[..., :-kd] * keep, s[..., -kd:]], dim=-1)
-                    else:
+                    # `state_dropout_keep_ranges` ([start, end) index pairs) exempts further dims.
+                    # Run 5 exempts the two wrist joint blocks (state layout: left_arm 0:7,
+                    # left_hand 7:27, right_arm 27:34, right_hand 34:54, phase one-hot 54:70)
+                    # because the grasp yaw is readable from the wrist joints but NOT from vision:
+                    # the pipette is a plain cylinder, so its rotation about its own axis leaves
+                    # the images unchanged and the policy has no other way to see it.
+                    protect = self._state_dropout_protect_mask(s)
+                    if protect is None:
                         s = s * keep
+                    else:
+                        # kept rows: s unchanged. dropped rows: exactly the protected dims survive.
+                        s = s * (keep + (1.0 - keep) * protect)
             with torch.autocast("cuda", dtype=torch.float32):
                 loss = self.action_model(h, a, s, encoder_attention_mask=m)
             return {"action_loss": loss}
