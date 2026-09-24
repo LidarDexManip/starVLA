@@ -59,18 +59,20 @@ class PolicyServerWrapper:
         device: str = "cuda",
         use_bf16: bool = False,
         unnorm_key: Optional[str] = None,
+        config_path: Optional[str] = None,
     ) -> None:
         self._ckpt_path = str(ckpt_path)
+        self._config_path = config_path
 
         logging.info("PolicyServerWrapper: loading framework from %s", self._ckpt_path)
-        framework = baseframework.from_pretrained(self._ckpt_path)
+        framework = baseframework.from_pretrained(self._ckpt_path, config_path=config_path)
         if use_bf16:
             framework = framework.to(torch.bfloat16)
         framework = framework.to(device).eval()
         self._framework = framework
 
         # Co-located metadata.
-        model_cfg, _ = read_mode_config(self._ckpt_path)
+        model_cfg, _ = read_mode_config(self._ckpt_path, config_path=config_path)
         self._model_cfg = model_cfg
 
         # action_chunk_size = future_action_window_size + 1 (matches old client).
@@ -103,7 +105,7 @@ class PolicyServerWrapper:
         self._norm_processors: Dict[str, PolicyNormProcessor] = {}
 
         # Peek at available keys without building a full processor.
-        _, _ns = read_mode_config(self._ckpt_path)
+        _, _ns = read_mode_config(self._ckpt_path, config_path=config_path)
         self._available_unnorm_keys: List[str] = list(_ns.keys())
 
         # Eagerly build when unambiguous; defer for multi-key / no explicit key.
@@ -131,7 +133,7 @@ class PolicyServerWrapper:
         cache_key = unnorm_key if unnorm_key is not None else "__default__"
         if cache_key not in self._norm_processors:
             self._norm_processors[cache_key] = PolicyNormProcessor(
-                self._ckpt_path, unnorm_key=unnorm_key
+                self._ckpt_path, unnorm_key=unnorm_key, config_path=self._config_path
             )
         return self._norm_processors[cache_key]
 

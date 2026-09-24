@@ -33,6 +33,7 @@ def main(args) -> None:
         device="cuda",
         use_bf16=args.use_bf16,
         unnorm_key=args.unnorm_key,
+        config_path=args.config_path,
     )
     policy = Gr00tCompatPolicy(
         wrapper,
@@ -68,6 +69,8 @@ def main(args) -> None:
 def build_argparser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt_path", type=str, required=True)
+    parser.add_argument("--config_path", type=str, default=None,
+                        help="Full training config; overrides the checkpoint's config.yaml.")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--use_bf16", action="store_true")
