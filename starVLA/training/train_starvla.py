@@ -136,6 +136,13 @@ def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
     return vla_train_dataloader
 
 
+def _truthy(v) -> bool:
+    """CLI overrides may arrive as strings ("true"/"false"); bool("false") is True."""
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
 class _DataCfgOverride:
     """``cfg.datasets.vla_data`` with a few keys replaced.
 
@@ -487,6 +494,22 @@ class VLATrainer(TrainerUtils):
 
     def train(self):
         """Execute training loop."""
+        if _truthy(getattr(self.config.trainer, "eval_only", False)):
+            # SCORE-ONLY: one holdout eval of the loaded weights -- no training
+            # step, no checkpoint, no final_model. Replaces the "warm start +
+            # huge intervals + kill after step0" trick, which had to run a full
+            # batch-16 forward/backward before the step-0 eval fired (~76 GB on
+            # a B200 -- too much next to a live training arm) and needed
+            # GRAD_ACCUM >= 2. Run it with NUM_PROCESSES=1 and K = 4x the
+            # 4-rank K to score the SAME [0, K x B) subset without DDP.
+            self._log_training_config()
+            if not self.holdout_batches:
+                logger.warning("trainer.eval_only is set but no eval_data_mix -- nothing to score")
+                return
+            self.eval_holdout({})
+            if dist.is_initialized():
+                barrier()
+            return
         self._log_training_config()
         self._create_data_iterators()
         progress_bar = tqdm(
@@ -592,6 +615,13 @@ class VLATrainer(TrainerUtils):
                                  line up across the A/B arms).
           eval/mse_ratio         mse_holdout / mse_zero_action (< 1 = the
                                  policy beats holding still)
+          eval/mse_{human,auto,masked,onset,relabel} + eval/frac_*
+                                 the same squared error split by the eval
+                                 dataset's per-frame Sirius weight (> 1, == 1,
+                                 == 0). Only present when the eval mixture
+                                 carries ``loss_weight_key``'s column -- i.e.
+                                 when scoring against CORRECTION data rather
+                                 than a base-distribution holdout.
         and, when q01/q99 are known, eval/rmse_dim{i} (and _zero) in the
         action's own units per step (metres for the FK heads).
         Sums are all-reduced so the number is over every rank's samples.
@@ -606,6 +636,27 @@ class VLATrainer(TrainerUtils):
         sse = sse0 = 0.0
         count = 0
         per_dim = per_dim0 = None
+        # When the eval dataset carries per-frame Sirius weights, split the SAME
+        # errors into the three regimes the weighting defines -- human-corrected
+        # frames (w > 1), autonomous frames (w == 1), and the masked-out frames
+        # (w == 0, which contribute no gradient and are reported only as a
+        # sanity check). A base-distribution holdout has no such column and
+        # these stay empty, so nothing changes for rounds 2-9.
+        #
+        # This is the axis the overall number cannot show: mse_holdout on a
+        # base-distribution holdout rewards an arm for CHANGING LESS, so it
+        # ranks regularisation cost. eval/mse_human on the correction data is
+        # where "did it actually absorb the takeovers" becomes visible.
+        # Two finer buckets for the HIL v2 arms: "onset" is the first ~1.5 s of
+        # each takeover (weight >= 4 under the v2 scheme; a subset of "human"),
+        # "relabel" is the anchors whose chunk the loader swapped for the
+        # human's path (sample["relabel_applied"], set only when the eval
+        # mixture is read with relabel_key). Both stay empty -- and unprinted --
+        # on any eval set that does not carry them.
+        b_names = ("human", "auto", "masked", "onset", "relabel")
+        nb = len(b_names)
+        b_sse = dict.fromkeys(b_names, 0.0)
+        b_count = dict.fromkeys(b_names, 0.0)
         for examples in self.holdout_batches:
             out = model.predict_action(examples=examples, use_ddim=True, num_ddim_steps=20)
             pred = np.asarray(out["normalized_actions"], dtype=np.float64)
@@ -616,6 +667,19 @@ class VLATrainer(TrainerUtils):
             count += err.size
             d = (err ** 2).sum(axis=(0, 1))
             per_dim = d if per_dim is None else per_dim + d
+            lw = [e["loss_weight"] for e in examples if "loss_weight" in e]
+            if len(lw) == len(examples):
+                # Same tail-alignment as the targets: predict_action may return a
+                # shorter horizon than the sample carries.
+                w = np.asarray(np.array(lw), dtype=np.float64)[:, -pred.shape[1]:]
+                sq = (err ** 2).sum(axis=2)  # (B, H), summed over dims
+                rf = np.asarray([float(e.get("relabel_applied", 0.0)) for e in examples],
+                                dtype=np.float64)
+                relabel = np.broadcast_to(rf[:, None] > 0.5, w.shape)
+                for name, mask in (("human", w > 1.0), ("auto", w == 1.0), ("masked", w == 0.0),
+                                   ("onset", w >= 4.0), ("relabel", relabel)):
+                    b_sse[name] += float(sq[mask].sum())
+                    b_count[name] += float(mask.sum()) * err.shape[2]
             if baseline_mode == "hold_first":
                 base = np.broadcast_to(tgt[:, :1, :], tgt.shape)
             elif zero is not None and zero.shape[0] == tgt.shape[-1]:
@@ -629,13 +693,17 @@ class VLATrainer(TrainerUtils):
                 per_dim0 = d0 if per_dim0 is None else per_dim0 + d0
         n_dims = int(per_dim.shape[0])
         vec = np.concatenate([[sse, sse0, float(count)], per_dim,
-                              per_dim0 if per_dim0 is not None else np.zeros(n_dims)])
+                              per_dim0 if per_dim0 is not None else np.zeros(n_dims),
+                              [b_sse[n] for n in b_names], [b_count[n] for n in b_names]])
         t = torch.tensor(vec, dtype=torch.float64, device=self.accelerator.device)
         if dist.is_initialized():
             dist.all_reduce(t)
         vec = t.cpu().numpy()
         sse, sse0, count = vec[0], vec[1], vec[2]
         per_dim, per_dim0 = vec[3:3 + n_dims], vec[3 + n_dims:3 + 2 * n_dims]
+        tail = 3 + 2 * n_dims
+        b_sse = dict(zip(b_names, vec[tail:tail + nb]))
+        b_count = dict(zip(b_names, vec[tail + nb:tail + 2 * nb]))
         if count <= 0:
             return step_metrics
         rows = count / n_dims  # (sample, step) pairs per dim
@@ -643,6 +711,10 @@ class VLATrainer(TrainerUtils):
         if per_dim0 is not None and sse0 > 0:
             step_metrics["eval/mse_zero_action"] = sse0 / count
             step_metrics["eval/mse_ratio"] = (sse / count) / max(sse0 / count, 1e-12)
+        for name in b_names:
+            if b_count[name] > 0:
+                step_metrics[f"eval/mse_{name}"] = b_sse[name] / b_count[name]
+                step_metrics[f"eval/frac_{name}"] = b_count[name] / count
         if half_span is not None and half_span.shape[0] == n_dims:
             for i in range(n_dims):
                 step_metrics[f"eval/rmse_dim{i}"] = float(np.sqrt(per_dim[i] / rows) * half_span[i])

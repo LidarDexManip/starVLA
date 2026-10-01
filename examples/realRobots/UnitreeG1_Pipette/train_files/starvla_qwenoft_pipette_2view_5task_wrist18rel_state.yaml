@@ -1,0 +1,156 @@
+# QwenOFT ROUND 10, "ROUND 9's RECIPE, BIMANUAL, on the FIVE-STEP bench capture"
+# (2026-09-27).  Dataset: HF jren313/g1-pipette-2view-teleop0925-5task-eerel
+# (237 eps / 162,623 frames @ 60 Hz, six PICO teleop sessions 09-24/25), each
+# episode ONE of five workflow steps with its own goal sentence:
+#   1 pipette pick (R hand) / 2 tube pick (L hand) / 3 aim pipette at tube
+#   (both) / 4 tube return (L hand) / 5 pipette return (R hand).
+#
+# WHAT CHANGES FROM ROUND 9 (starvla_qwenoft_pipette_3view_hil293plus21_wrist8rel_state_crop3):
+#
+#   1. ACTION 8 -> 18, BIMANUAL: left wrist rel6 + right wrist rel6 + left
+#      hand rel1 (thumb_bend) + right hand rel5 (pinky..thumb_bend), every
+#      block chunk-relative to the last COMMAND exactly as round 9's right
+#      wrist/thumb were (position subtracted, rotation the exact body-frame
+#      relative rotation via action_mode_rotvec_dims, hand registers
+#      subtracted).  Two of the five steps are LEFT-hand tasks (left path
+#      ~400 mm per episode against ~157 mm right), so a right-only head cannot
+#      perform them; the hand channels are the ones this capture actually
+#      moves (R fingers 0..1000 for the pipette grasp, L thumb_bend ~910 for
+#      the tube grasp; thumb_rot never moves).
+#
+#   2. STATE 43 -> 59: 29 joints + measured L/R wrist pose6 + COMMANDED L/R
+#      wrist pose6 + commanded L hand1 + commanded R hand5, the commanded
+#      blocks through byte-copy columns (round-9 rule: never alias the label
+#      column whose statistics rel mode overwrites).
+#
+#   3. VIEWS 3 -> 2, NO CENTRE CROPS: video.rgb (head 1280x720) and
+#      video.wrist_left (1080 square, a wide fisheye) are plain-resized to 270
+#      and cropped 256 (the round-2/6 chain).  The head view keeps the pipette
+#      holder at its right edge and the tube rack at its left edge, so the
+#      round-7/8 centre-720 crop would cut both targets off.  obs_image_size
+#      [256, 256], expected_num_views 2.
+#
+#   4. PAUSE FILTER key -> action.both_wrist_xyz (commanded L xyz ++ R xyz):
+#      keep an anchor when EITHER wrist moves >= 1 mm over the chunk.  Filtering
+#      on the right wrist alone would drop ~10% of the left-hand steps' anchors
+#      and keep their static-right-hand chunks as zero labels.
+#
+#   5. DATA: one capture, 15% holdout by RECORDING (94 recordings were cut into
+#      pick/return halves -- adjacent episodes -- and the halves stay on the
+#      same side of the split), stratified by recording type, seed 1234:
+#      202 train / 35 eval episodes.  ONE rel-mode statistics file computed on
+#      the train split and copied into the eval dir.
+#
+# EVERYTHING ELSE IS ROUND 9 VERBATIM: 95% random crop + 5 deg rotation +
+# ColorJitter + colour temperature per view, state prompt on, 30-row horizon,
+# 21 x accum 2 x 3 GPUs = 126, the same learning rates and cosine schedule,
+# eval every 500 on the fixed holdout [0, 480) (K=10, B=16 on 3 ranks), save
+# every 1000.  L1 head, so the round-6 pause-filter caveat (per-axis zero
+# mass) still applies; on this capture the 6-vector filter drops 1-2%.
+#
+# STEP BUDGET: 10 epochs over the post-pause-filter train anchors at batch 126
+# (count printed by scratchpad build_5task_wrist18rel.py); MAX_TRAIN_STEPS is
+# exported by the launcher.
+#
+# SERVING NEEDS BRIDGE WORK (not part of this round): two wrists integrated
+# from their last COMMANDED pose (position added, rotation composed), hand
+# registers added to the last commanded hand, a 59-dim state built in this
+# loader's order, and a lane with two views and no view_crop.
+#
+run_id: starvla_qwenoft_pipette_2view_5task_wrist18rel_state
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: jren313-georgia-institute-of-technology
+wandb_project: starVLA_unitree_g1_pipette
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenOFT
+  qwenvl:
+    base_vlm: /data/jren313/models/Qwen3-VL-4B-Instruct
+    attn_implementation: sdpa
+    enable_gradient_checkpointing: true
+  action_model:
+    action_model_type: MLP
+    # == Pipette2ViewOFTWrist18RelDataConfig.action_key_dims: L rel6 + R rel6 + L hand1 + R hand5
+    action_dim: 18
+    # == sum(state_key_dims): 29 joints + 12 measured pose + 12 commanded pose + 6 commanded hand
+    state_dim: 59
+    action_horizon: 30
+    action_hidden_dim: 2560
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /home/jren313/Datasets
+    data_mix: unitree_g1_pipette_2view_oft_wrist18_rel_train_mix
+    eval_data_mix: unitree_g1_pipette_2view_oft_wrist18_rel_eval_mix
+    # 3 ranks x 10 x 16 = 480 fixed holdout samples from the 35 held-out
+    # episodes (all five step types), as in rounds 8/9.
+    eval_num_batches: 10
+    eval_batch_size: 16
+    # Row 0 of every rel label is identically zero (both poses AND hands), so
+    # repeating it is the physical hold-still baseline.
+    eval_baseline: hold_first
+    expected_num_views: 2
+    lerobot_version: v2.0
+    action_type: abs_qpos
+    # The action-space change. Both keys are anchored at their COMMANDED
+    # state alias (byte-copy columns, see the header); the pose key's dims
+    # [3, 6) are a rotation vector and get the exact relative rotation.
+    action_mode: rel
+    action_mode_apply_keys: ["action.left_wrist_rel6", "action.right_wrist_rel6",
+                             "action.left_hand_rel", "action.right_hand_rel"]
+    action_mode_state_map:
+      action.left_wrist_rel6: state.left_wrist_cmd6
+      action.right_wrist_rel6: state.right_wrist_cmd6
+      action.left_hand_rel: state.left_hand_cmd
+      action.right_hand_rel: state.right_hand_cmd
+    action_mode_rotvec_dims:
+      action.left_wrist_rel6: [3, 6]
+      action.right_wrist_rel6: [3, 6]
+    # 1.0 mm on the commanded wrist xyz (alias [0:3] of the pose column) --
+    # round 8's gate on the same physical quantity. TRAIN MIXTURE ONLY.
+    pause_filter_mm: 1.0
+    pause_filter_key: action.both_wrist_xyz
+    sequential_step_sampling: false
+    # 21 x accum 2 x 3 GPUs = 126, rounds 8/9's pair.
+    per_device_batch_size: 21
+    load_all_data_for_training: true
+    obs_image_size: [256, 256]
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 8
+
+trainer:
+  # 10 epochs at batch 126 over the post-pause-filter TRAIN anchors, measured
+  # by scratchpad build_5task_wrist18rel.py: 137741 anchors (138642 frames,
+  # 202 episodes) / 126 = 1093.2 steps/epoch, x10 = 10932 -> 10900.
+  max_train_steps: 10900
+  num_warmup_steps: 600
+  save_interval: 1000
+  eval_interval: 500
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt

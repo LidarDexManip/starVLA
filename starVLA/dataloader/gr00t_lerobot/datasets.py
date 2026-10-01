@@ -68,6 +68,10 @@ LE_ROBOT_DATA_FILENAME = "data/*/*.parquet"
 LE_ROBOT_STEPS_FILENAME = "meta/steps.pkl"
 LE_ROBOT_STATS_FORMAT_VERSION = 2
 EPSILON = 5e-4
+# Per-sample marker (1.0 / 0.0) that get_step_data attaches when a
+# ``relabel_key`` is configured; finish_sample carries it around the
+# transforms into the sample, next to "loss_weight".
+RELABEL_FLAG_KEY = "relabel_applied"
 
 #  LeRobot v3.0 dataset file names 
 LE_ROBOT3_TASKS_FILENAME = "meta/tasks.parquet"
@@ -799,6 +803,45 @@ class LeRobotSingleDataset(Dataset):
             else "action.right_ee_xyz"
         )
 
+        # HIL / Sirius-style per-timestep loss weights (2026-09-15). When set,
+        # this names a RAW parquet column (e.g. "action.loss_weight", one
+        # float per frame, written by the intervention build script) that is
+        # chunked over the SAME window as the action labels and delivered
+        # untouched as sample["loss_weight"] (H,). It is deliberately kept out
+        # of the modality configs: it must never be normalised, concatenated
+        # into the action vector, or seen by action_mode / the stats cache.
+        # Datasets without the column simply omit the sample key, so a mixture
+        # of weighted HIL episodes and unweighted base demos trains with the
+        # demos at implicit weight 1.0.
+        self._loss_weight_key = (
+            str(_pf_cfg.get("loss_weight_key")) if _pf_cfg is not None
+            and _pf_cfg.get("loss_weight_key") else None
+        )
+        self._loss_weight_warned = False
+
+        # HIL round-8 v2 (2026-09-17): EIL/DAgger-style RELABEL of the frames
+        # just before a takeover. ``relabel_key`` names a RAW parquet column
+        # holding, per frame, either NaN (no relabel) or a fully materialised
+        # ABSOLUTE action chunk (H*D floats, row-major) that REPLACES the
+        # chunk read from consecutive rows for every key in
+        # ``relabel_apply_keys`` (default: the action_mode_apply_keys), BEFORE
+        # action_mode runs -- so ``rel`` still subtracts the anchor's own
+        # commanded pose and the label reads "the human's path from where you
+        # are now", drift cancellation included. Per-anchor chunks cannot be
+        # expressed by editing shared rows (every row is a member of ~H
+        # chunks), which is why this is a column OF chunks, not a rewrite of
+        # the trajectory. Like loss_weight it is not a modality: never
+        # normalised as a column, never in the stats cache.
+        self._relabel_key = (
+            str(_pf_cfg.get("relabel_key")) if _pf_cfg is not None
+            and _pf_cfg.get("relabel_key") else None
+        )
+        self._relabel_apply_keys = (
+            list(_pf_cfg.get("relabel_apply_keys") or [])
+            if _pf_cfg is not None else []
+        )
+        self._relabel_warned = False
+
         self.modality_configs = modality_configs
         self.video_backend = video_backend
         self.video_backend_kwargs = video_backend_kwargs if video_backend_kwargs is not None else {}
@@ -1406,6 +1449,19 @@ class LeRobotSingleDataset(Dataset):
         t = np.arange(len(arr))
         end = np.minimum(t + last, len(arr) - 1)
         motion_mm = np.linalg.norm(arr[end] - arr[t], axis=1) * 1000.0
+        if self._relabel_key and self._relabel_key in data.columns:
+            # A relabelled anchor carries the HUMAN's chunk, so its motion is
+            # that chunk's own end-to-end displacement. Measured on the
+            # original column these anchors are exactly the ones the filter
+            # would drop -- the policy stalling is often WHY the operator took
+            # over -- and the relabel would never be sampled.
+            rl = data[self._relabel_key].to_numpy()
+            width = arr.shape[1]
+            for i in range(min(len(rl), len(arr))):
+                r = np.asarray(rl[i], dtype=np.float64).reshape(-1)
+                if r.size and not np.isnan(r[0]):
+                    r = r.reshape(-1, width)
+                    motion_mm[i] = np.linalg.norm(r[min(last, len(r) - 1)] - r[0]) * 1000.0
         return motion_mm >= self.pause_filter_mm
 
     def _get_position_and_gripper_values(self, data: pd.DataFrame) -> tuple[list, list]:
@@ -1707,8 +1763,28 @@ class LeRobotSingleDataset(Dataset):
         """
         trajectory_id, base_index = self.all_steps[index]
         raw_data = self.get_step_data(trajectory_id, base_index)
+        return self.finish_sample(raw_data)
+
+    def finish_sample(self, raw_data: dict) -> dict:
+        """transforms + _pack_sample, carrying the per-timestep loss weights
+        AROUND the transform pipeline: they are training metadata, not a
+        modality, and no transform (least of all a normaliser) may touch
+        them. Both __getitem__ and LeRobotMixtureDataset.__getitem__ must
+        route through here — the mixture used to inline these steps, which
+        would silently drop the weights."""
+        loss_weight = (
+            raw_data.pop(self._loss_weight_key, None)
+            if self._loss_weight_key else None
+        )
+        relabel_flag = raw_data.pop(RELABEL_FLAG_KEY, None)
         data = self.transforms(raw_data)
-        return self._pack_sample(data)
+        sample = self._pack_sample(data)
+        if loss_weight is not None:
+            sample["loss_weight"] = np.asarray(
+                loss_weight, dtype=np.float32).reshape(-1)
+        if relabel_flag is not None:
+            sample[RELABEL_FLAG_KEY] = float(relabel_flag)
+        return sample
 
     def _pack_sample(self, data: dict) -> dict:
         """Pack transformed modality data into training sample format.
@@ -1804,8 +1880,98 @@ class LeRobotSingleDataset(Dataset):
             # Get the data corresponding to each key in the modality
             for key in self.modality_keys[modality]:
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
+        relabelled = self._apply_relabel(data, base_index) if self._relabel_key else None
         data = self._apply_action_mode(data)
+        if relabelled is not None:
+            # Carried around the transforms by finish_sample (like loss_weight)
+            # so the holdout eval can score the relabelled anchors as their own
+            # bucket: "does the policy now output the human's path on the
+            # states where it used to drift into a takeover".
+            data[RELABEL_FLAG_KEY] = np.float32(1.0 if relabelled else 0.0)
+        if self._loss_weight_key:
+            lw = self._get_loss_weight_chunk(trajectory_id, base_index)
+            if lw is not None:
+                data[self._loss_weight_key] = lw
         return data
+
+    def _apply_relabel(self, data: dict, base_index: int) -> bool:
+        """Swap this anchor's ABSOLUTE action chunk for its relabel chunk, if any.
+
+        Runs before ``_apply_action_mode`` on purpose: the stored chunk is the
+        human's absolute commanded path from the takeover press, and the
+        ``rel`` subtraction of the anchor's commanded pose is what turns it
+        into "start the correction from here". Rows whose relabel cell is NaN
+        (the overwhelming majority) are untouched, so a dataset that carries
+        the column but relabels nothing trains exactly as before. Returns
+        whether this anchor was relabelled.
+        """
+        assert self.curr_traj_data is not None
+        col = self._relabel_key
+        if col not in self.curr_traj_data.columns:
+            if not self._relabel_warned:
+                self._relabel_warned = True
+                print(f"[relabel] column {col!r} not in dataset "
+                      f"{self._dataset_name!r} — no relabels applied")
+            return False
+        row = np.asarray(self.curr_traj_data[col].iloc[int(base_index)],
+                         dtype=np.float32).reshape(-1)
+        if row.size == 0 or np.isnan(row[0]):
+            return False
+        keys = self._relabel_apply_keys or list(self._action_mode_apply_keys or [])
+        applied = False
+        for key in keys:
+            if key not in data:
+                continue
+            chunk = np.asarray(data[key])
+            if row.size != chunk.size:
+                raise ValueError(
+                    f"[relabel] {col!r} holds {row.size} floats per row but the "
+                    f"{key!r} chunk is {chunk.shape} -- rebuild the column with "
+                    "the DataConfig's action horizon and key width"
+                )
+            data[key] = row.reshape(chunk.shape).astype(chunk.dtype, copy=False)
+            applied = True
+        return applied
+
+    def _get_loss_weight_chunk(self, trajectory_id: int, base_index: int):
+        """Per-timestep loss weights over the ACTION window, or None.
+
+        Reads the raw parquet column named by ``loss_weight_key`` directly
+        (it is not a declared modality, so `get_state_or_action`'s
+        metadata lookups do not apply) and slices it with the FIRST action
+        key's delta indices — the same window the labels use, so weight[t]
+        annotates exactly action-target row t. Out-of-range steps pad
+        "first_last", matching the absolute-command padding of the labels
+        (a repeated final command keeps that frame's weight). A dataset
+        without the column warns once and contributes no weights (implicit
+        1.0 in the loss).
+        """
+        assert self.curr_traj_data is not None
+        col = self._loss_weight_key
+        if col not in self.curr_traj_data.columns:
+            if not self._loss_weight_warned:
+                self._loss_weight_warned = True
+                print(
+                    f"[loss_weight] column {col!r} not in dataset "
+                    f"{self._dataset_name!r} — its samples train at "
+                    "weight 1.0"
+                )
+            return None
+        action_keys = self.modality_keys.get("action") or []
+        if not action_keys:
+            return None
+        ref_key = action_keys[0]
+        step_indices = self.delta_indices[ref_key] + base_index
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        max_length = self.trajectory_lengths[trajectory_index]
+        arr = np.stack(self.curr_traj_data[col])
+        arr = np.asarray(arr, dtype=np.float32).reshape(len(arr), -1)
+        return self.retrieve_data_and_pad(
+            array=arr,
+            step_indices=step_indices,
+            max_length=max_length,
+            padding_strategy="first_last",
+        )
 
     def get_trajectory_data(self, trajectory_id: int) -> pd.DataFrame:
         """Get the data for a trajectory."""
@@ -2748,11 +2914,11 @@ class LeRobotMixtureDataset(Dataset):
                         break
                     index = random.randint(0, len(self) - 1)
                     
-                raw_data = dataset.get_step_data(trajectory_id, step)    
-                data = dataset.transforms(raw_data)
-                sample = dataset._pack_sample(data)
-                
-                return sample
+                raw_data = dataset.get_step_data(trajectory_id, step)
+                # finish_sample = transforms + _pack_sample + the loss-weight
+                # carry-around; inlining those steps here used to silently
+                # drop sample["loss_weight"] for mixture training.
+                return dataset.finish_sample(raw_data)
                 
             except Exception as e:
                 last_exception = e

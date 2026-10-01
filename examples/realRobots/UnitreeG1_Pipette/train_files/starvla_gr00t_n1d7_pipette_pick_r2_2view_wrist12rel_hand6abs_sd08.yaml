@@ -1,0 +1,181 @@
+# GR00T-N1.7 PIPETTE PICK, ROUND 2 (2026-09-29): "hands ABSOLUTE, wrists
+# chunk-relative", on pick round 1's step-1 data, under round 10's GR00T twin
+# recipe.
+#
+# DATA: the same 54 train / 9 held-out step-1 episodes as pick round 1 (round
+# 10's recording-level split restricted to step 1), two plain-resized 256
+# views, the same 59-dim state, 1 mm pause filter on the both-wrist 6-vector
+# (36,558 train anchors).
+#
+# THE ACTION-SPACE CHANGE (DataConfig unitree_g1_pipette_2view_wrist12rel_hand6abs):
+# 18 dims in round 1's order. Wrists still chunk-relative to the last command
+# (exact relative rotation on dims [3, 6)); hands now ABSOLUTE registers
+# (L thumb_bend; R pinky/ring/middle/index/thumb_bend). Only the two wrist keys
+# are in action_mode_apply_keys; the class docstring has the measurements.
+#
+# THE MODEL (round 10's GR00T twin, unchanged): CosmosGR00TN1d7 with every
+# nvidia/GR00T-N1.7-3B tensor, embodiment slot 25, select_layer 16, one state
+# frame with STATE DROPOUT 0.8, flow matching (so the OFT head's L1 zero-mass
+# caveat does not apply), paged_adamw_8bit 2e-5 backbone / 2e-4 head, warmup
+# 100, cosine to 1e-6, press weighting off.
+#
+# SCHEDULE: batch 128 (32 x 4 GPUs, no accumulation; round 1's 126 does not
+# split over 4 GPUs) and 2,856 steps = 10 epochs. Eval AND save every 250 so
+# every holdout point has weights (round 1's best, step 750, was never saved).
+# The holdout (4 ranks x 10 x 12) is round 1's 480 samples, indices [0, 480).
+#
+# NOT COMPARABLE to round 1 on mse_ratio: the hand dims are normalised over
+# absolute register spans instead of delta spans, and the head changed too.
+# The wrist dims carry identical labels under identical statistics.
+#
+# SERVING: not built -- round 1's lane with the hand rows as register targets.
+#
+run_id: starvla_gr00t_n1d7_pipette_pick_r2_2view_wrist12rel_hand6abs_sd08
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: jren313-georgia-institute-of-technology
+wandb_project: starVLA_unitree_g1_pipette
+is_debug: false
+version_id: "0.1"
+framework:
+  name: CosmosGR00TN1d7
+  # N1.7 checkpoint dir (contains model-*.safetensors). Leave null to auto-find
+  # the snapshot in the HF cache (models--nvidia--GR00T-N1.7-3B).
+  pretrained_gr00t_n1d7: null
+  # 25 = unitree_g1_full_body_with_waist_height_nav_cmd, as the round-10 twin:
+  # the slot only selects which pretrained projector rows warm-start.
+  embodiment_id: 25
+  tune_llm: true
+  tune_visual: true
+  enable_gradient_checkpointing: true
+  qwenvl:
+    base_vlm: nvidia/Cosmos-Reason2-2B
+    attn_implementation: sdpa
+    select_layer: 16
+  action_model:
+    # 18 = L/R wrist rel6 + L thumb_bend + R pinky..thumb_bend (see the
+    # DataConfig); 59 = 29 joints + measured and commanded L/R wrist pose6 +
+    # commanded L hand1 / R hand5.
+    action_dim: 18
+    state_dim: 59
+    action_horizon: 30
+    # --- everything below matches nvidia/GR00T-N1.7-3B config.json and MUST NOT
+    #     change if you want the pretrained head to keep loading 1:1 ---
+    max_action_dim: 132
+    max_state_dim: 132
+    # ONE state frame; MUST match the DataConfig's state_indices [0].
+    state_history_length: 1
+    max_num_embodiments: 32
+    backbone_embedding_dim: 2048
+    input_embedding_dim: 1536
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    use_vlln: true
+    use_alternate_vl_dit: true
+    attend_text_every_n_blocks: 2
+    num_inference_timesteps: 4
+    num_timestep_buckets: 1000
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    # The round-10 twin's value: the 59-dim state is zeroed on 80% of
+    # samples, so the head has to read the cameras, hand targets included.
+    state_dropout_prob: 0.8
+    # 1.0 == press-frame weighting DISABLED (the 18-D action has no dim 18;
+    # the dim/thresh below are inert).
+    grasp_loss_weight: 1.0
+    grasp_weight_dim: 18
+    grasp_weight_thresh: 0.04
+    diffusion_model_cfg:
+      num_attention_heads: 32
+      attention_head_dim: 48
+      output_dim: 1024
+      num_layers: 32
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      positional_embeddings: null
+    vl_self_attention_cfg:
+      num_attention_heads: 32
+      attention_head_dim: 64
+      num_layers: 4
+      dropout: 0.2
+      final_dropout: true
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /home/jren313/Datasets
+    data_mix: unitree_g1_pipette_2view_p1_wrist12rel_hand6abs_train_mix
+    eval_data_mix: unitree_g1_pipette_2view_p1_wrist12rel_hand6abs_eval_mix
+    # 4 ranks x 10 x 12 = 480 fixed holdout samples from the 9 held-out
+    # step-1 episodes: indices [0, 480), the same samples as round 1's 3 x 10 x 16.
+    eval_num_batches: 10
+    eval_batch_size: 12
+    # Repeats each sample's row 0: zero on the rel wrist dims, the current
+    # hand command on the absolute hand dims -- "hold still" for both.
+    eval_baseline: hold_first
+    expected_num_views: 2
+    lerobot_version: v2.0
+    action_type: abs_qpos
+    # rel on the WRISTS ONLY, anchored at their commanded state aliases
+    # (byte-copy columns); dims [3, 6) get the exact relative rotation. The
+    # hand keys are left out on purpose: absolute labels AND statistics.
+    action_mode: rel
+    action_mode_apply_keys: ["action.left_wrist_rel6", "action.right_wrist_rel6"]
+    action_mode_state_map:
+      action.left_wrist_rel6: state.left_wrist_cmd6
+      action.right_wrist_rel6: state.right_wrist_cmd6
+    action_mode_rotvec_dims:
+      action.left_wrist_rel6: [3, 6]
+      action.right_wrist_rel6: [3, 6]
+    # 1.0 mm over the chunk on the commanded L xyz ++ R xyz. TRAIN MIXTURE ONLY.
+    pause_filter_mm: 1.0
+    pause_filter_key: action.both_wrist_xyz
+    sequential_step_sampling: false
+    # 32 x 4 GPUs (4,5,6,7), no accumulation = 128.
+    per_device_batch_size: 32
+    load_all_data_for_training: true
+    obs_image_size: [256, 256]
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 8
+
+trainer:
+  # 10 epochs at batch 128 over the 36,558 post-pause-filter train anchors:
+  # 285.6 steps/epoch x 10 = 2856.
+  max_train_steps: 2856
+  num_warmup_steps: 100
+  # Every eval point is saved too: 11 + final = 12 x 8.9 GB = ~107 GB.
+  save_interval: 250
+  eval_interval: 250
+  learning_rate:
+    base: 2.0e-05
+    qwen_vl_interface: 2.0e-05
+    action_head: 2.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  # Informational only — real accum comes from ACCELERATE_GRADIENT_ACCUMULATION_STEPS
+  # exported by the launcher (Accelerator is built at import time). Keep in sync.
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+
+  optimizer:
+    name: paged_adamw_8bit
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  save_format: pt

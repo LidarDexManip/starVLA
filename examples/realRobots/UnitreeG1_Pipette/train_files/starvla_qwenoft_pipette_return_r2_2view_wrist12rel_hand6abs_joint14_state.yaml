@@ -1,0 +1,129 @@
+# QwenOFT PIPETTE RETURN, ROUND 2 (2026-10-01): phase 5 of the five-step capture
+# ALONE -- "Put the pipette held in the right hand back into the holder on the right." --
+# with the QwenOFT head on the GR00T rounds' action space: wrists chunk-relative,
+# BOTH hands ABSOLUTE registers, plus the 14 ABSOLUTE arm joints (the bridge IK's
+# warm start). DataConfig unitree_g1_pipette_2view_wrist12rel_hand6abs_joint14, as
+# pipette pick round 3 and tube pick round 1.
+#
+# PREVIOUS ROUNDS OF THIS TASK: pipette return round 1 (GR00T, left thumb rel).
+#
+# WHY QwenOFT WITH ABSOLUTE HANDS: the GR00T rounds missed per-episode hand HOLD
+# levels with absolute hand labels (pick R2: R thumb_bend 137 vs 0.5 registers;
+# tube pick R1: L thumb 98.6 vs 35.9; pipette return R1: R thumb 131 vs 8). Their
+# state dropout 0.8 hides the commanded hand registers on most samples; QwenOFT
+# reads the 59-dim state (commanded hand registers included) on EVERY sample.
+#
+# QwenOFT RECIPE = pipette pick round 1's (starvla_qwenoft_pipette_pick_r1_2view_
+# wrist18rel_state.yaml): Qwen3-VL-4B full fine-tune, MLP L1 head, 30-row horizon,
+# 59-dim state, LRs 2.5e-5 / 1e-5 / 1e-4, cosine to 1e-6, warmup 5.5% of the
+# steps, AdamW. Only the action space (32 dims) and the data differ.
+#
+# DATA: round 10's recording-level split restricted to step 5: 54 / 9 episodes
+# (eval 11 13 33 41 69 79 83 103 119); 38,749 / 6,264 frames; the 1 mm both-wrist pause
+# filter keeps 38,568 train anchors. Dirs g1-pipette-2view-5task-wrist12rel-
+# hand6abs-joint14-p5-{train,eval}; statistics over the train episodes:
+# computed by the loader on the train dir, byte-copied into the eval dir.
+#
+# SCHEDULE: batch 128 (16 x accum 2 x 4 GPUs), 10 epochs = 3013 steps, eval every
+# 300 (about an epoch, the GR00T runs' eval points), save every 600 + final_model.
+# Holdout = 4 ranks x 10 x 12 = indices [0, 480) of the eval mixture: the GR00T
+# rounds' and round 10's exact samples. Compare in physical units against the
+# TRUE labels; mse / ratio are not comparable across phases.
+#
+run_id: starvla_qwenoft_pipette_return_r2_2view_wrist12rel_hand6abs_joint14_state
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: jren313-georgia-institute-of-technology
+wandb_project: starVLA_unitree_g1_pipette
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenOFT
+  qwenvl:
+    base_vlm: /data/jren313/models/Qwen3-VL-4B-Instruct
+    attn_implementation: sdpa
+    enable_gradient_checkpointing: true
+  action_model:
+    action_model_type: MLP
+    # == Pipette2ViewWrist12RelHand6AbsJoint14DataConfig.action_key_dims: L/R wrist
+    # rel6 + L thumb_bend abs + R pinky..thumb_bend abs + L/R arm joints 7 + 7 abs
+    action_dim: 32
+    # == sum(state_key_dims): 29 joints + 12 measured pose + 12 commanded pose + 6 commanded hand
+    state_dim: 59
+    action_horizon: 30
+    action_hidden_dim: 2560
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /home/jren313/Datasets
+    data_mix: unitree_g1_pipette_2view_p5_wrist12rel_hand6abs_joint14_train_mix
+    eval_data_mix: unitree_g1_pipette_2view_p5_wrist12rel_hand6abs_joint14_eval_mix
+    # 4 ranks x 10 x 12 = 480 fixed holdout samples from the held-out
+    # step-5 episodes: indices [0, 480) of the eval mixture.
+    eval_num_batches: 10
+    eval_batch_size: 12
+    # Repeats each sample's row 0: zero on the rel wrist dims, the current
+    # hand/joint command on the absolute dims -- "hold still" for all three.
+    eval_baseline: hold_first
+    expected_num_views: 2
+    lerobot_version: v2.0
+    action_type: abs_qpos
+    # rel on the WRISTS ONLY, anchored at their commanded state aliases
+    # (byte-copy columns); dims [3, 6) get the exact relative rotation. The
+    # hand and joint keys are left out on purpose: absolute labels AND
+    # statistics.
+    action_mode: rel
+    action_mode_apply_keys: ["action.left_wrist_rel6", "action.right_wrist_rel6"]
+    action_mode_state_map:
+      action.left_wrist_rel6: state.left_wrist_cmd6
+      action.right_wrist_rel6: state.right_wrist_cmd6
+    action_mode_rotvec_dims:
+      action.left_wrist_rel6: [3, 6]
+      action.right_wrist_rel6: [3, 6]
+    # 1.0 mm over the chunk on the commanded L xyz ++ R xyz. TRAIN MIXTURE ONLY.
+    pause_filter_mm: 1.0
+    pause_filter_key: action.both_wrist_xyz
+    sequential_step_sampling: false
+    # 16 x accum 2 x 4 GPUs = 128 (the round-8 FT pair on node 3's B200s).
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    obs_image_size: [256, 256]
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 8
+
+trainer:
+  # 10 epochs at batch 128 over the 38,568 post-pause-filter train anchors:
+  # 301.3 steps/epoch x 10 = 3013.
+  max_train_steps: 3013
+  # 600 of 10,900 in round 10, 160 of 2,900 in pick round 1: the same 5.5%.
+  num_warmup_steps: 166
+  save_interval: 600
+  eval_interval: 300
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  # Informational only -- real accum comes from ACCELERATE_GRADIENT_ACCUMULATION_STEPS
+  # exported by the launcher (Accelerator is built at import time). Keep in sync.
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_format: pt

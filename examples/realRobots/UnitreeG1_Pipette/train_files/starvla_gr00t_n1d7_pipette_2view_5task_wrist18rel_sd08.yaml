@@ -1,0 +1,225 @@
+# GR00T-N1.7 ROUND 10 TWIN, "the ROUND-10 DATA CONTRACT under the N1.7 flow-matching
+# head, state dropout 0.8" (2026-09-28).
+#
+# SAME DATA CONTRACT AS starvla_qwenoft_pipette_2view_5task_wrist18rel_state.yaml,
+# byte-for-byte in the datasets block: the five-step bench capture, 18-D bimanual
+# chunk-relative action (L/R wrist pose6 with the exact relative rotation + L
+# thumb_bend + R fingers/thumb_bend), 59-dim state through the byte-copy command
+# anchors, two plain-resized 256 views, 1 mm pause filter on the both-hands
+# 6-vector, the same 202/35 recording-level split and the same rel statistics
+# (DataConfig unitree_g1_pipette_2view_oft_wrist18_rel, reused on purpose so the
+# two heads see identical samples).
+#
+# WHAT IS THE GR00T SIDE (rounds 11-15's N1.7 recipe, memoryless):
+#   * framework CosmosGR00TN1d7: Cosmos-Reason2-2B backbone truncated at layer
+#     16 + the N1.7 alternate-VL DiT, all nvidia/GR00T-N1.7-3B tensors loaded,
+#     embodiment slot 25, action/state padded to 132.  Flow matching, so the
+#     head predicts a DISTRIBUTION over chunks -- the round-6 L1-median /
+#     per-axis zero-mass caveat of the OFT head does not apply here.
+#   * state_history_length 1 (single frame; HG-DAgger memoryless rule) and
+#     STATE DROPOUT 0.8: on 80% of training samples the 59-dim state is zeroed,
+#     so the head cannot lean on the commanded anchors and must read the
+#     cameras (the operator's request; round 11's value).
+#   * press-frame weighting DISABLED (grasp_loss_weight 1.0): it keyed on the
+#     right-hand thumb register at dim 18 of the 27-dim joint action, which
+#     does not exist in this action space.
+#   * rounds 11-15's optimiser/LR: paged_adamw_8bit, 2e-5 backbone / 2e-4 head,
+#     warmup 100, cosine to 1e-6.
+#
+# MATCHED TO THE OFT TWIN so the holdout curves compare: effective batch 126
+# (21 x accum 2 x 3 GPUs), 10,900 steps = 10 epochs over the 137,741 anchors,
+# eval every 500 on the same fixed [0, 480) holdout, save every 1000.  Ratios
+# are comparable between the two twins (same action channels, same holdout);
+# NOT to rounds 6-9.
+#
+# SERVING: same bimanual bridge lane as the OFT twin (not built), served through
+# the GR00T ZMQ path with two views and no view_crop.
+#
+run_id: starvla_gr00t_n1d7_pipette_2view_5task_wrist18rel_sd08
+run_root_dir: outputs/starvla
+seed: 42
+wandb_entity: jren313-georgia-institute-of-technology
+wandb_project: starVLA_unitree_g1_pipette
+is_debug: false
+version_id: "0.1"
+framework:
+  name: CosmosGR00TN1d7
+  # N1.7 checkpoint dir (contains model-*.safetensors). Leave null to auto-find
+  # the snapshot in the HF cache (models--nvidia--GR00T-N1.7-3B).
+  pretrained_gr00t_n1d7: null
+  # 25 = unitree_g1_full_body_with_waist_height_nav_cmd. Our action layout is
+  # arms | right_hand | base_height | navigate(vx,vy,yaw_rate), which is the
+  # same category order, so this slot still warm-starts the projector rows.
+  embodiment_id: 25
+  tune_llm: true
+  tune_visual: true
+  enable_gradient_checkpointing: true
+  qwenvl:
+    base_vlm: nvidia/Cosmos-Reason2-2B
+    attn_implementation: sdpa
+    select_layer: 16
+  action_model:
+    # left_arm7 + right_arm7 + hand_right6 + root_height1 + lin_vel_xy2 +
+    # yaw_rate1 = 24 action dims; waist3 + left_arm7 + right_arm7 = 17 state.
+    # UNCHANGED from the single-view recipe: the tipcrop dataset's state/action
+    # parquets are byte-identical to the source, and its own meta/stats.json
+    # reproduces the same degenerate-dim census.
+    action_dim: 18
+    state_dim: 59
+    # 30, and NO LONGER == len(action_indices): round 4's DataConfig loads
+    # 30 + MAX_LAG actions so VisionLagJitter has something to slide over,
+    # then hands the head exactly 30 back. Changing MAX_LAG does not change
+    # this number.
+    action_horizon: 30
+    # --- everything below matches nvidia/GR00T-N1.7-3B config.json and MUST NOT
+    #     change if you want the pretrained head to keep loading 1:1 ---
+    max_action_dim: 132
+    max_state_dim: 132
+    # ROUND 4: four state frames, matching the DataConfig's
+    # state_indices [-36, -24, -12, 0] (0.6 s). This is the ONE architectural
+    # change, and the reason the pretrained state_encoder needs widening.
+    # ROUND 11: ONE state frame, not 4. MUST match the DataConfig's
+    # state_indices [0]; a mismatch feeds the state_encoder 132*4 where
+    # 132 arrived and the shapes disagree loudly at the first step.
+    state_history_length: 1
+    max_num_embodiments: 32
+    backbone_embedding_dim: 2048
+    input_embedding_dim: 1536
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    use_vlln: true
+    use_alternate_vl_dit: true
+    attend_text_every_n_blocks: 2
+    num_inference_timesteps: 4
+    num_timestep_buckets: 1000
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    # 0.8 -> 0.3. The old value was chosen to FORCE camera reliance, and it
+    # succeeded: at 80% dropout the head spent most of training with no proprio
+    # at all, which is coherent with serving --no_state but leaves nothing to
+    # break the up/down tie. It cannot stay high here or the history is trained
+    # away. It should not go to 0.0 either: joint angles alone predict the next
+    # action well on a repetitive bench task, and a head that takes that
+    # shortcut stops looking at the rack. 0.3 keeps vision load-bearing while
+    # letting state be present on most steps.
+    # ROUND 11: 0.8, as round 8 used. With only one state frame there is
+    # no temporal redundancy left, so this is the strongest push toward
+    # solving the task from PIXELS rather than from proprioception.
+    state_dropout_prob: 0.8
+    # --- press-phase frame weighting (CosmosGR00T_N1d7._frame_weights) --------
+    # OFF, deliberately. This run changes the VISION path; leaving the loss
+    # identical to the single-view recipe is what makes the two comparable. If
+    # the baseline under-presses the ejector, turn it on THEN — dim 18 ==
+    # action.hand_right[4] == thumb_bend, and under min_max on 0..1000 a +0.04
+    # threshold (raw > 520) flags 1.68% of frames.
+    # 1.0 == press-frame weighting DISABLED (the 18-D action has no right-hand
+    # thumb register at dim 18; the dim/thresh below are inert).
+    grasp_loss_weight: 1.0
+    grasp_weight_dim: 18
+    grasp_weight_thresh: 0.04
+    diffusion_model_cfg:
+      num_attention_heads: 32
+      attention_head_dim: 48
+      output_dim: 1024
+      num_layers: 32
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      positional_embeddings: null
+    vl_self_attention_cfg:
+      num_attention_heads: 32
+      attention_head_dim: 64
+      num_layers: 4
+      dropout: 0.2
+      final_dropout: true
+      positional_embeddings: null
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    include_state: true
+    data_root_dir: /home/jren313/Datasets
+    data_mix: unitree_g1_pipette_2view_oft_wrist18_rel_train_mix
+    eval_data_mix: unitree_g1_pipette_2view_oft_wrist18_rel_eval_mix
+    # 3 ranks x 10 x 16 = 480 fixed holdout samples from the 35 held-out
+    # episodes (all five step types), as in rounds 8/9.
+    eval_num_batches: 10
+    eval_batch_size: 16
+    # Row 0 of every rel label is identically zero (both poses AND hands), so
+    # repeating it is the physical hold-still baseline.
+    eval_baseline: hold_first
+    expected_num_views: 2
+    lerobot_version: v2.0
+    action_type: abs_qpos
+    # The action-space change. Both keys are anchored at their COMMANDED
+    # state alias (byte-copy columns, see the header); the pose key's dims
+    # [3, 6) are a rotation vector and get the exact relative rotation.
+    action_mode: rel
+    action_mode_apply_keys: ["action.left_wrist_rel6", "action.right_wrist_rel6",
+                             "action.left_hand_rel", "action.right_hand_rel"]
+    action_mode_state_map:
+      action.left_wrist_rel6: state.left_wrist_cmd6
+      action.right_wrist_rel6: state.right_wrist_cmd6
+      action.left_hand_rel: state.left_hand_cmd
+      action.right_hand_rel: state.right_hand_cmd
+    action_mode_rotvec_dims:
+      action.left_wrist_rel6: [3, 6]
+      action.right_wrist_rel6: [3, 6]
+    # 1.0 mm on the commanded wrist xyz (alias [0:3] of the pose column) --
+    # round 8's gate on the same physical quantity. TRAIN MIXTURE ONLY.
+    pause_filter_mm: 1.0
+    pause_filter_key: action.both_wrist_xyz
+    sequential_step_sampling: false
+    # 21 x accum 2 x 3 GPUs = 126, rounds 8/9's pair.
+    per_device_batch_size: 21
+    load_all_data_for_training: true
+    # ONE size for both views (the GR00T rounds' per-view list is not needed
+    # here: rgb and wrist_left both go to 256).
+    obs_image_size: [256, 256]
+    delete_pause_frame: false
+    video_backend: decord
+    num_workers: 8
+
+trainer:
+  # 10000 steps is ~33.7 epochs over the 37,943 truncated frames @ batch 128,
+  # against 18.5 over the full capture -- the step count is held constant so
+  # this run stays comparable with round 6 on the axis that changed (views and
+  # segment), not on schedule length. Watch the eval curve: at nearly twice
+  # the epochs, overfitting shows up earlier than it did in round 6.
+  max_train_steps: 10900
+  num_warmup_steps: 100
+  save_interval: 1000                 # 9.5 GB per checkpoint — 10 + final = ~105 GB on /data
+  eval_interval: 500
+  learning_rate:
+    base: 2.0e-05
+    qwen_vl_interface: 2.0e-05
+    action_head: 2.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  # Informational only — real accum comes from ACCELERATE_GRADIENT_ACCUMULATION_STEPS
+  # exported by the launcher (Accelerator is built at import time). Keep in sync.
+  gradient_accumulation_steps: 2
+  gradient_checkpointing: true
+
+  optimizer:
+    # paged_adamw_8bit, as in the single-view recipe. The 8xB200 wristcam run
+    # used plain adamw; on a 180 GB card either fits, and 8-bit states are what
+    # make a local smoke test on a 16 GB card possible at all. Override with
+    # --trainer.optimizer.name adamw to match that run exactly.
+    name: paged_adamw_8bit
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  save_format: pt

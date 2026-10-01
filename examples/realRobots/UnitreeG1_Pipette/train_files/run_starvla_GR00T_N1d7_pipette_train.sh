@@ -119,6 +119,20 @@ fi
 if [[ -n "${PRETRAINED_CHECKPOINT}" ]]; then
   EXTRA_ARGS+=(--trainer.pretrained_checkpoint "${PRETRAINED_CHECKPOINT}")
 fi
+# Holdout knobs + SCORE-ONLY mode, mirrored from the QwenOFT launcher: EVAL_ONLY=1
+# runs ONE eval_holdout of the loaded weights and exits (no train step, no save).
+if [[ -n "${EVAL_DATA_MIX-}" ]]; then
+  EXTRA_ARGS+=(--datasets.vla_data.eval_data_mix "${EVAL_DATA_MIX}")
+fi
+if [[ -n "${EVAL_NUM_BATCHES-}" ]]; then
+  EXTRA_ARGS+=(--datasets.vla_data.eval_num_batches "${EVAL_NUM_BATCHES}")
+fi
+if [[ -n "${EVAL_BATCH_SIZE-}" ]]; then
+  EXTRA_ARGS+=(--datasets.vla_data.eval_batch_size "${EVAL_BATCH_SIZE}")
+fi
+if [[ "${EVAL_ONLY:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--trainer.eval_only true)
+fi
 
 # Rendezvous port. The default 29500 is what EVERY accelerate/torchrun job
 # on a shared box also defaults to — a second user launching at the same

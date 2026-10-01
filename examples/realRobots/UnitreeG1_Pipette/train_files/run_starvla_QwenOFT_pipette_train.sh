@@ -17,6 +17,18 @@
 #   CUDA_VISIBLE_DEVICES=0 MAX_TRAIN_STEPS=10 SAVE_INTERVAL=100000 \
 #   EVAL_INTERVAL=100000 PER_DEVICE_BATCH_SIZE=4 RUN_ID=smoke_oft \
 #   bash examples/realRobots/UnitreeG1_Pipette/train_files/run_starvla_QwenOFT_pipette_train.sh
+#
+# SCORE-ONLY (no training, no save): EVAL_ONLY=1 makes the trainer run ONE
+# holdout eval of the loaded checkpoint and exit -- no training step, no
+# checkpoint, no final_model. Single process, so the subset is [0, K x B):
+# use K = 4x the 4-rank K to score the same samples (1 x 160 x 12 == 4 x 40 x 12).
+#   CUDA_VISIBLE_DEVICES=0 NUM_PROCESSES=1 EVAL_ONLY=1 \
+#   EVAL_DATA_MIX=<score mix> EVAL_NUM_BATCHES=160 EVAL_BATCH_SIZE=12 \
+#   PRETRAINED_CHECKPOINT=<ckpt> PER_DEVICE_BATCH_SIZE=4 \
+#   bash examples/realRobots/UnitreeG1_Pipette/train_files/run_starvla_QwenOFT_pipette_train.sh
+# (The old way -- warm start, GRAD_ACCUM_STEPS>=2, huge intervals, kill after
+# "holdout eval: step0" -- still works but runs a full batch-16 forward/backward
+# before the eval fires: ~76 GB on a B200, an OOM next to a live training arm.)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -88,6 +100,33 @@ echo "[launcher] framework=QwenOFT base_vlm='${BASE_VLM}' FULL fine-tune (no fre
 EXTRA_ARGS=()
 if [[ -n "${PRETRAINED_CHECKPOINT}" ]]; then
   EXTRA_ARGS+=(--trainer.pretrained_checkpoint "${PRETRAINED_CHECKPOINT}")
+fi
+# Score against a DIFFERENT holdout than the yaml pins. Unset keeps the yaml's
+# own yardstick, which is what every training run wants. Set it to re-score a
+# finished arm on correction data, where eval_holdout also reports the
+# per-frame-weight buckets (eval/mse_human vs eval/mse_auto).
+#
+# The holdout SUBSET is indices [0, NUM_PROCESSES x K x B), so when re-scoring
+# arms across machines keep the PRODUCT equal (4 x 40 x 12 == 1 x 160 x 12) or
+# the arms are not being compared on the same samples.
+if [[ -n "${EVAL_DATA_MIX-}" ]]; then
+  EXTRA_ARGS+=(--datasets.vla_data.eval_data_mix "${EVAL_DATA_MIX}")
+fi
+if [[ -n "${EVAL_NUM_BATCHES-}" ]]; then
+  EXTRA_ARGS+=(--datasets.vla_data.eval_num_batches "${EVAL_NUM_BATCHES}")
+fi
+if [[ -n "${EVAL_BATCH_SIZE-}" ]]; then
+  EXTRA_ARGS+=(--datasets.vla_data.eval_batch_size "${EVAL_BATCH_SIZE}")
+fi
+# HIL v2 relabel arm: the raw parquet column of per-anchor absolute action
+# chunks that replace the pre-takeover labels (loader `_apply_relabel`).
+# Unset = no relabelling, even on a dataset that carries the column.
+if [[ -n "${RELABEL_KEY-}" ]]; then
+  EXTRA_ARGS+=(--datasets.vla_data.relabel_key "${RELABEL_KEY}")
+fi
+# Score-only: one holdout eval of the loaded checkpoint, then exit (see header).
+if [[ "${EVAL_ONLY:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--trainer.eval_only true)
 fi
 
 accelerate launch \

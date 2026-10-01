@@ -165,37 +165,58 @@ class Qwenvl_OFT(baseframework):
         self.grasp_weight_thresh = float(_am.get("grasp_weight_thresh", -0.143))
         self._grasp_weight_logged = False
 
-    def _weighted_l1(self, pred_actions, actions_target):
+    def _weighted_l1(self, pred_actions, actions_target, timestep_w=None):
         """Weighted-mean L1: `L = Σ wₜ·|pred−tgt| / Σ wₜ`.
 
-        The plunger press is a SHORT phase (~21% of frames on the long-horizon
-        piston set), so a uniform mean averages it away. A frame is flagged when
-        the right-hand thumb channel (``grasp_weight_dim``, 25 ==
-        ``action.right_hand[5]``) sits above ``grasp_weight_thresh``, i.e. lifted
-        off its rest value; flagged frames get ``grasp_loss_weight`` on ALL of
-        their action dims. Because it is a weighted MEAN it stays on the same
-        scale as ``nn.L1Loss()``, so LR / grad-clip carry over unchanged.
+        Two independent weight sources multiply into one per-timestep weight
+        [B, H]:
+
+        * PRESS-PHASE weighting (``grasp_loss_weight`` != 1.0). The plunger
+          press is a SHORT phase (~21% of frames on the long-horizon piston
+          set), so a uniform mean averages it away. A frame is flagged when
+          the right-hand thumb channel (``grasp_weight_dim``, 25 ==
+          ``action.right_hand[5]``) sits above ``grasp_weight_thresh``, i.e.
+          lifted off its rest value; flagged frames get ``grasp_loss_weight``
+          on ALL of their action dims.
+        * DATASET weighting (``timestep_w``, [B, H] or None): Sirius/IWR-style
+          per-frame weights from the HIL intervention build — 0 masks a
+          timestep outright (takeover transients, pre-takeover drift), >1
+          upweights human-correction frames.
+
+        Because it is a weighted MEAN it stays on the same scale as
+        ``nn.L1Loss()``, so LR / grad-clip carry over unchanged. A batch whose
+        weights sum to ~0 (every target masked) contributes ~zero loss rather
+        than NaN via the epsilon.
         """
-        d = self.grasp_weight_dim
-        press = actions_target[:, :, d] > self.grasp_weight_thresh  # [B, H]
-        if not self._grasp_weight_logged:
-            self._grasp_weight_logged = True
-            frac = press.float().mean().item()
-            logger.info(
-                f"[press-frame weighting] dim={d} thresh={self.grasp_weight_thresh} "
-                f"weight={self.grasp_loss_weight} -> {frac * 100:.1f}% of frames "
-                f"flagged in the first batch."
-            )
-            if frac < 0.01 or frac > 0.99:
-                logger.warning(
-                    "[press-frame weighting] the flag fires on ~all or ~no frames, so "
-                    "the weighted mean collapses back to the plain mean (a silent "
-                    f"no-op). Check that action dim {d} actually VARIES in this "
-                    "dataset: when q01 == q99 StateActionTransform passes the raw "
-                    "value through un-normalised, so the threshold is compared "
-                    "against a raw number."
+        w = torch.ones(
+            actions_target.shape[:2],
+            device=actions_target.device, dtype=actions_target.dtype,
+        )  # [B, H]
+        if self.grasp_loss_weight != 1.0:
+            d = self.grasp_weight_dim
+            press = actions_target[:, :, d] > self.grasp_weight_thresh  # [B, H]
+            if not self._grasp_weight_logged:
+                self._grasp_weight_logged = True
+                frac = press.float().mean().item()
+                logger.info(
+                    f"[press-frame weighting] dim={d} thresh={self.grasp_weight_thresh} "
+                    f"weight={self.grasp_loss_weight} -> {frac * 100:.1f}% of frames "
+                    f"flagged in the first batch."
                 )
-        w = (1.0 + (self.grasp_loss_weight - 1.0) * press.to(actions_target.dtype)).unsqueeze(-1)
+                if frac < 0.01 or frac > 0.99:
+                    logger.warning(
+                        "[press-frame weighting] the flag fires on ~all or ~no frames, so "
+                        "the weighted mean collapses back to the plain mean (a silent "
+                        f"no-op). Check that action dim {d} actually VARIES in this "
+                        "dataset: when q01 == q99 StateActionTransform passes the raw "
+                        "value through un-normalised, so the threshold is compared "
+                        "against a raw number."
+                    )
+            w = w * (1.0 + (self.grasp_loss_weight - 1.0) * press.to(actions_target.dtype))
+        if timestep_w is not None:
+            w = w * timestep_w.to(dtype=actions_target.dtype,
+                                  device=actions_target.device)
+        w = w.unsqueeze(-1)  # [B, H, 1]
         per_elem = (pred_actions - actions_target).abs()  # [B, H, action_dim]
         return (per_elem * w).sum() / (w.expand_as(per_elem).sum() + 1e-6)
 
@@ -229,6 +250,11 @@ class Qwenvl_OFT(baseframework):
         state = (
             [example["state"] for example in examples] if "state" in examples[0] else None
         )  # List[ndarray (1, state_dim)] or None
+        # Sirius/IWR per-timestep loss weights (see _weighted_l1). Samples
+        # from unweighted datasets carry no key and default to 1.0, so a
+        # mixture of HIL and base demos needs no special casing.
+        loss_weights = [example.get("loss_weight") for example in examples]
+        has_loss_weights = any(lw is not None for lw in loss_weights)
 
         # Optionally prepend discretised proprioceptive state tokens to each instruction (π₀.5 style).
         instructions = (
@@ -269,9 +295,27 @@ class Qwenvl_OFT(baseframework):
             )  # [B, T_full, action_dim]
             actions_target = actions[:, -self.action_horizon :, :]  # (B, action_horizon, action_dim)
 
-            # Compute L1 loss (optionally up-weighting the short press phase)
-            if self.grasp_loss_weight != 1.0:
-                action_loss = self._weighted_l1(pred_actions, actions_target)
+            timestep_w = None
+            if has_loss_weights:
+                H = actions_target.shape[1]
+                rows = []
+                for lw in loss_weights:
+                    if lw is None:
+                        rows.append(np.ones(H, dtype=np.float32))
+                    else:
+                        rows.append(
+                            np.asarray(lw, dtype=np.float32).reshape(-1)[-H:]
+                        )
+                timestep_w = torch.tensor(
+                    np.stack(rows), device=pred_actions.device,
+                    dtype=pred_actions.dtype,
+                )  # [B, H], aligned with the -action_horizon: label slice
+
+            # Compute L1 loss (optionally up-weighting the short press phase
+            # and/or applying the dataset's per-timestep HIL weights)
+            if self.grasp_loss_weight != 1.0 or timestep_w is not None:
+                action_loss = self._weighted_l1(
+                    pred_actions, actions_target, timestep_w)
             else:
                 action_loss = self.l1_loss(pred_actions, actions_target)
 

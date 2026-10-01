@@ -1505,6 +1505,246 @@ class Pipette3ViewOFTWrist8RelCrop3DataConfig(Pipette3ViewOFTEERelCrop3DataConfi
     }
 
 
+class Pipette2ViewOFTWrist18RelDataConfig(Pipette3ViewOFTEEDataConfig):
+    """Round 10 (2026-09-27): round 9's chunk-relative wrist-pose + hand recipe,
+    made BIMANUAL, on the five-step bench capture
+    ``g1-pipette-2view-teleop0925-5task`` (237 eps, 2 views, 5 task sentences).
+
+    WHY BIMANUAL. Two of the five steps are LEFT-hand tasks (tube pick / tube
+    return: left path ~400 mm per episode, right ~157 mm; median in-chunk
+    motion 10-11 mm left vs 2.5 mm right), so round 9's right-only action space
+    cannot perform them. The five sentences select the step; the head has to
+    be able to move whichever arm the sentence names.
+
+    ACTION 18 dims, all CHUNK-RELATIVE to the last COMMAND (round 9's rule):
+        action.left_wrist_rel6   6   pose(cmd[t+i]) (-) pose(cmd[t]), left_rubber_hand
+        action.right_wrist_rel6  6   same, right_rubber_hand
+        action.left_hand_rel     1   hand_left[t+i][4:5] - hand_left[t][4:5]  (thumb_bend)
+        action.right_hand_rel    5   hand_right[t+i][0:5] - hand_right[t][0:5]
+      Position part subtracted (metres, pelvis frame); rotation part the EXACT
+      body-frame relative rotation through ``action_mode_rotvec_dims`` on dims
+      [3, 6) of both wrist keys (round-9 loader patch; elementwise rotvec
+      subtraction is wrong by degrees). Rotation vectors stay far from the pi
+      wrap here (max absolute wrist angle 1.72 rad, max chunk-relative
+      rotation ~25 deg). The HAND channels are the ones that carry signal in
+      this capture: the right-hand pipette grasp closes pinky/ring/middle/index
+      (0..1000) with ~50 registers of thumb_bend, the left-hand tube grasp is
+      thumb_bend alone (~910); thumb_rot never moves on either hand. Raw
+      Inspire registers, as every register-native lane serves.
+
+    STATE 59 dims = 29 body joints + measured L pose6 + measured R pose6 +
+      COMMANDED L pose6 + COMMANDED R pose6 + commanded L hand1 + commanded R
+      hand5. The commanded blocks are the chunk anchors, read through aliases
+      of BYTE-COPY columns (``action.*_wrist_cmd6``, ``action.*_hand_cmd``):
+      ``action_mode: rel`` overwrites the statistics of the column it is
+      applied to, so an alias of the label column would be normalised with the
+      +-mm rel span and saturate (rounds 6-8 did exactly that). Note the
+      capture's right-hand FEEDBACK is frozen (dataset README), which is why
+      the hand blocks are the commanded registers, not observation.state.hand_*.
+
+    VIEWS 2: ``video.rgb`` (head, 1280x720) and ``video.wrist_left`` (1080
+      square), both PLAIN-RESIZED to 270 and cropped 256 -- the round-2/6 chain
+      inherited unchanged, NO centre crops. The head view frames the whole
+      bench with the pipette holder at its right edge and the tube rack at its
+      left edge, so round 7/8's centre-720 crop would cut both targets off;
+      the second view is a wide fisheye. ``serve_view_preprocess`` (resize 270
+      -> centre 256) is therefore exact for serving with no bridge view_crop.
+
+    PAUSE FILTER on ``action.both_wrist_xyz`` (commanded L xyz ++ R xyz, one
+      6-vector): an anchor is kept when EITHER hand moves >= 1 mm over the
+      chunk. Round 9's right-wrist key would drop ~10% of the left-hand steps'
+      anchors and keep their static-right-hand chunks as zero labels; on the
+      6-vector only 0.5-2% of anchors are dropped per step type.
+
+    DATA ``g1-pipette-2view-5task-wrist18rel-{train,eval}`` (scratchpad
+      build_5task_wrist18rel.py): 15% holdout by RECORDING (the pick/return
+      halves of one recording stay together), stratified by recording type,
+      seed 1234; ONE rel-mode statistics file computed on the train split and
+      copied into the eval dir. Language = the per-episode goal sentence
+      (``annotation.human.task_description`` -> tasks.jsonl row 3k).
+
+    SERVING (not built): integrate BOTH wrists from their last commanded pose
+    (position added, rotation composed), add hand registers to the last
+    commanded hand; 59-dim state assembled in this order. Registered as
+    ``unitree_g1_pipette_2view_oft_wrist18_rel``.
+    """
+
+    video_keys = ["video.rgb", "video.wrist_left"]
+
+    state_keys = [
+        "state.left_leg",
+        "state.right_leg",
+        "state.waist",
+        "state.left_arm",
+        "state.right_arm",
+        "state.left_wrist_pose6",    # FK(measured), absolute
+        "state.right_wrist_pose6",
+        "state.left_wrist_cmd6",     # FK(commanded) = the pose anchors, absolute
+        "state.right_wrist_cmd6",
+        "state.left_hand_cmd",       # commanded thumb_bend = the left hand anchor
+        "state.right_hand_cmd",      # commanded fingers+thumb_bend = the right hand anchor
+    ]
+    state_key_dims = {
+        "state.left_leg": 6,
+        "state.right_leg": 6,
+        "state.waist": 3,
+        "state.left_arm": 7,
+        "state.right_arm": 7,
+        "state.left_wrist_pose6": 6,
+        "state.right_wrist_pose6": 6,
+        "state.left_wrist_cmd6": 6,
+        "state.right_wrist_cmd6": 6,
+        "state.left_hand_cmd": 1,
+        "state.right_hand_cmd": 5,
+    }
+
+    action_keys = ["action.left_wrist_rel6", "action.right_wrist_rel6",
+                   "action.left_hand_rel", "action.right_hand_rel"]
+    action_key_dims = {"action.left_wrist_rel6": 6, "action.right_wrist_rel6": 6,
+                       "action.left_hand_rel": 1, "action.right_hand_rel": 5}
+    action_normalization_modes = {k: "q99" for k in action_keys}
+
+
+class Pipette2ViewWrist12RelHand6AbsDataConfig(Pipette2ViewOFTWrist18RelDataConfig):
+    """Pipette pick ROUND 2 (2026-09-29): round 1's step-1 data with the HANDS
+    ABSOLUTE and the wrists still chunk-relative; trained under GR00T-N1.7.
+
+    ACTION 18 dims, the same channels in the same order as round 1:
+        action.left_wrist_rel6   6   chunk-relative to the last command (unchanged)
+        action.right_wrist_rel6  6   same
+        action.left_hand_abs     1   hand_left[t+i][4:5]   raw registers (thumb_bend)
+        action.right_hand_abs    5   hand_right[t+i][0:5]  raw registers
+      Only the two wrist keys go in ``action_mode_apply_keys``. The hand keys
+      are plain aliases of the absolute register columns, so ``action_mode:
+      rel`` leaves both their labels and their statistics absolute.
+
+    WHY. On the 54 train episodes the right fingers are a two-state target:
+      78.5% of frames at 0 (closed), 20.4% at 1000 (open), 1.2% in between.
+      As an absolute label that reads "open or closed"; as a chunk delta it is
+      0 almost everywhere with a -1000 step on the 1,920 anchors whose chunk
+      holds the closure, and a mispredicted delta carries into the next
+      anchor. The wrists keep round 9's reason for rel (absolute pose has too
+      little resolution for the approach). The left thumb_bend never moves
+      inside a step-1 episode (constant in all 54; per-episode values
+      189/413/505/506/1000), so its absolute label is that episode's hold
+      value where round 1 had a zero-span delta.
+
+    STATE unchanged (59 dims). The commanded hand blocks now equal row 0 of
+      the hand labels instead of anchoring them. Views, split and pause filter
+      unchanged: the both-wrist 1 mm filter drops 208 of 36,766 anchors, 6 of
+      them among the 1,920 grasp-closure anchors.
+
+    DATA ``g1-pipette-2view-5task-wrist12rel-hand6abs-p1-{train,eval}``: data/
+      and videos/ symlink round 1's p1 dirs; own meta/ and statistics. The
+      stats cache key does not include the apply keys, so round 1's file
+      would silently serve REL hand statistics.
+
+    SERVING (not built): wrists as round 1; hand rows are register TARGETS
+      (clip 0..1000), not increments on the last command.
+    """
+
+    action_keys = ["action.left_wrist_rel6", "action.right_wrist_rel6",
+                   "action.left_hand_abs", "action.right_hand_abs"]
+    action_key_dims = {"action.left_wrist_rel6": 6, "action.right_wrist_rel6": 6,
+                       "action.left_hand_abs": 1, "action.right_hand_abs": 5}
+    action_normalization_modes = {k: "q99" for k in action_keys}
+
+
+class Pipette2ViewWrist12RelHand6AbsJoint14DataConfig(Pipette2ViewWrist12RelHand6AbsDataConfig):
+    """Pipette pick ROUND 3 (2026-09-29): round 2 plus the ABSOLUTE arm joint
+    angles as a second output, trained under the same GR00T-N1.7 twin recipe.
+
+    ACTION 32 dims: round 2's 18 in round 2's order, then
+        action.left_arm_abs      7   action[t+i][15:22]   commanded joints, rad
+        action.right_arm_abs     7   action[t+i][22:29]   same
+      Plain aliases of the main ``action`` column (no ``original_key`` = the
+      LeRobot default ``action``), NOT in ``action_mode_apply_keys``: absolute
+      labels and absolute statistics. Named ``*_arm_abs``, never ``left_arm``
+      / ``right_arm``, because a served ``left_arm`` is an EXECUTED joint
+      target to the bridge; these rows are only the IK solver's warm start.
+
+    WHY. The 7-DoF arm has one joint-space direction the 6-D wrist pose does
+      not pin (the elbow swivel). The bridge's IK walks each chunk from the
+      last command, so the elbow sits wherever that walk drifted. With the
+      joints predicted too, each row's IK starts from the posture the model
+      read off the demonstrations, and the wrist target still comes from the
+      chunk-relative head.
+
+    THE TWO LABELS AGREE BY CONSTRUCTION: ``action.{left,right}_wrist_pose6``
+      == FK(action[:29]) on all 63 step-1 episodes to 2e-8 m / 6e-8 rad
+      (bridge UrdfKinematics, the vendored training URDF), so a perfect joint
+      row seeds the IK exactly at its target. Train q01..q99, rad:
+        L  [-0.033, 0.396, -0.240, 0.057, -0.689, -0.727, -0.173]
+        .. [ 0.323, 0.650,  0.204, 0.526,  0.379, -0.296,  0.623]
+        R  [-0.229, -0.634, 0.044, -0.268, 0.268, -0.834, 0.096]
+        .. [ 0.183, -0.251, 0.672,  0.743, 0.725,  0.118, 0.797]
+
+    STATE, views, split and pause filter: round 2's (59-dim state; its 29
+      joints are the MEASURED arm, so the joint head cannot copy its input).
+
+    DATA ``g1-pipette-2view-5task-wrist12rel-hand6abs-joint14-p1-{train,eval}``:
+      data/ and videos/ symlink round 1's p1 dirs, own meta/ and statistics
+      (modality.json adds the two joint aliases).
+
+    SERVING: rel6 -> joints as round 2, with row k's IK seeded from
+      ``*_arm_abs[k]`` instead of row k-1's solution; the joint rows are never
+      published as targets.
+    """
+
+    action_keys = ["action.left_wrist_rel6", "action.right_wrist_rel6",
+                   "action.left_hand_abs", "action.right_hand_abs",
+                   "action.left_arm_abs", "action.right_arm_abs"]
+    action_key_dims = {"action.left_wrist_rel6": 6, "action.right_wrist_rel6": 6,
+                       "action.left_hand_abs": 1, "action.right_hand_abs": 5,
+                       "action.left_arm_abs": 7, "action.right_arm_abs": 7}
+    action_normalization_modes = {k: "q99" for k in action_keys}
+
+
+class Pipette2ViewWrist12RelLThumbRelJoint14DataConfig(Pipette2ViewWrist12RelHand6AbsJoint14DataConfig):
+    """Per-phase recipe v2 (2026-09-30): pick round 3's recipe with the LEFT
+    THUMB back to CHUNK-RELATIVE. Used for tube pick round 2 (phase 2) and
+    round 1 of phases 3, 4 and 5, each trained alone.
+
+    ACTION 32 dims, round 3's layout with dim 12 changed:
+        action.left_wrist_rel6   6   rel to the last command (unchanged)
+        action.right_wrist_rel6  6   same
+        action.left_hand_rel     1   hand_left[t+i][4:5] - hand_left[t][4:5]
+                                     (thumb_bend), anchored at state.left_hand_cmd
+                                     -- round 10's alias and anchor
+        action.right_hand_abs    5   hand_right[t+i][0:5] raw registers (unchanged)
+        action.left_arm_abs      7   commanded joints, absolute (unchanged)
+        action.right_arm_abs     7   same
+      ``action_mode_apply_keys`` = the two wrists + ``action.left_hand_rel``;
+      the state map adds ``action.left_hand_rel: state.left_hand_cmd``.
+
+    WHY. Tube pick round 1 (phase 2 alone, round 3's recipe): the ABSOLUTE left
+      thumb -- the tube grasp -- scored 98.6 registers RMS on the 480 held-out
+      samples against round 10's 35.9 (hold 51.0). While the thumb waits open
+      it had to guess each episode's open level (742..1000; true 817 ->
+      predicted 982), which a delta on the current command gets for free
+      (open-hold 140 vs 34), and it was worse than holding still through the
+      closure (148 vs 127). Wrists were equal (4.06 vs 3.87 mm). The right hand
+      stays absolute, as asked.
+
+    DATA ``g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p{2,3,4,5}-{train,eval}``
+      (scratchpad build_lthumbrel_dirs.py): data/ and videos/ symlink the
+      phase's wrist18rel split dir; own meta/ and OWN statistics -- never the
+      joint14 dirs' file, whose thumb span is absolute (the stats cache key
+      ignores the apply keys).
+
+    SERVING (not built): wrists and joints as round 3; the left thumb row is an
+      increment on the last commanded thumb (round 10's hand path).
+    """
+
+    action_keys = ["action.left_wrist_rel6", "action.right_wrist_rel6",
+                   "action.left_hand_rel", "action.right_hand_abs",
+                   "action.left_arm_abs", "action.right_arm_abs"]
+    action_key_dims = {"action.left_wrist_rel6": 6, "action.right_wrist_rel6": 6,
+                       "action.left_hand_rel": 1, "action.right_hand_abs": 5,
+                       "action.left_arm_abs": 7, "action.right_arm_abs": 7}
+    action_normalization_modes = {k: "q99" for k in action_keys}
+
+
 ROBOT_TYPE_CONFIG_MAP = {
     "unitree_g1_pipette_n1d7": PipetteTipG1GR00TN1d7DataConfig(),
     "unitree_g1_pipette_armhand_n1d7": PipetteTipG1ArmHandOnlyDataConfig(),
@@ -1553,6 +1793,23 @@ ROBOT_TYPE_CONFIG_MAP = {
     # chunk-relative action (wrist pose6 + thumb2) on hil293 + plus21.
     "unitree_g1_pipette_3view_oft_wrist8_rel_crop3":
         Pipette3ViewOFTWrist8RelCrop3DataConfig(),
+    # Round 10 (2026-09-27): round 9's rel recipe made bimanual (18-D: both
+    # wrist pose6 + L thumb_bend + R fingers/thumb_bend), two plain-resized
+    # views, on the five-step bench capture. See the class.
+    "unitree_g1_pipette_2view_oft_wrist18_rel":
+        Pipette2ViewOFTWrist18RelDataConfig(),
+    # Pipette pick round 2 (2026-09-29): round 1's step-1 data, wrists
+    # chunk-relative, hands ABSOLUTE registers. See the class.
+    "unitree_g1_pipette_2view_wrist12rel_hand6abs":
+        Pipette2ViewWrist12RelHand6AbsDataConfig(),
+    # Pipette pick round 3 (2026-09-29): round 2 plus the absolute arm
+    # joints (14) as the bridge IK's warm start. See the class.
+    "unitree_g1_pipette_2view_wrist12rel_hand6abs_joint14":
+        Pipette2ViewWrist12RelHand6AbsJoint14DataConfig(),
+    # Per-phase recipe v2 (2026-09-30): round 3 with the LEFT THUMB relative
+    # (tube pick round 2; phases 3, 4, 5 round 1). See the class.
+    "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14":
+        Pipette2ViewWrist12RelLThumbRelJoint14DataConfig(),
     # Round 12: round 11 with the wrist views centre-cropped 1080 -> 720
     # BEFORE the 448 resize. Same three views, same token count.
     "unitree_g1_pipette_3view_nohist_crop720_n1d7":
@@ -1833,6 +2090,103 @@ DATASET_NAMED_MIXTURES = {
         ("g1-pipette-3view-hil293-eerel-eval", 1.0,
          "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
     ],
+    # ROUND-8 HIL FT (2026-09-15): the hil293 base plus the round-8
+    # HG-DAgger corrections, Sirius-weighted per FRAME via their
+    # action.loss_weight column (scratchpad build_hil_r8_weights.py;
+    # loss_weight_key in the FT yaml ships it to QwenOFT's weighted L1 —
+    # the hil293 member has no such column and trains at weight 1.0).
+    # SET THE MIXTURE WEIGHTS TO THE POST-FILTER FRAME COUNTS AT BUILD
+    # TIME (round-9 pattern) — 1.0/1.0 here would badly over-sample the
+    # small HIL set. The hilr8 dirs MUST byte-copy hil293-eerel-train's
+    # meta/stats_gr00t.json (the round-15 own-stats confound).
+    # WEIGHTS SET 2026-09-16 from the post-filter anchor counts (round-9
+    # pattern): hil293 253,594 (round 8's exact count) vs hilr8 101,569 of
+    # 123,102 frames surviving the same 1.0 mm rule (82.51% -- within 0.2 pt
+    # of hil293's 82.63%, measured by scratchpad census_hilr8.py). The HIL
+    # set therefore draws 28.6% of samples -- its natural pooled share.
+    "unitree_g1_pipette_3view_oft_ee_rel_crop3_hilr8_train_mix": [
+        ("g1-pipette-3view-hil293-eerel-train", 253594.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+        ("g1-pipette-3view-hilr8-eerel-train", 101569.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+    ],
+    # W_HUMAN SWEEP (2026-09-16, operator request): same mixture, same
+    # sampling weights, same masks — the ONLY variable is the human-core
+    # frame weight baked into action.loss_weight (rebuild_weight_arms.py
+    # remaps 2.0 -> {1,4,8} in sibling dirs with hardlinked videos).
+    # Human share of total gradient mass: w1 8.4%, w2 15.5% (the main FT),
+    # w4 26.9%, w8 42.4% (~IWR's class-balance regime).
+    "unitree_g1_pipette_3view_oft_ee_rel_crop3_hilr8_train_mix_w1": [
+        ("g1-pipette-3view-hil293-eerel-train", 253594.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+        ("g1-pipette-3view-hilr8-eerel-train-w1", 101569.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+    ],
+    "unitree_g1_pipette_3view_oft_ee_rel_crop3_hilr8_train_mix_w4": [
+        ("g1-pipette-3view-hil293-eerel-train", 253594.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+        ("g1-pipette-3view-hilr8-eerel-train-w4", 101569.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+    ],
+    "unitree_g1_pipette_3view_oft_ee_rel_crop3_hilr8_train_mix_w8": [
+        ("g1-pipette-3view-hil293-eerel-train", 253594.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+        ("g1-pipette-3view-hilr8-eerel-train-w8", 101569.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+    ],
+    # HIL v2 ARMS (2026-09-17, operator request after the hardware verdict on
+    # every v1 arm was "no improvement"). Same hil293 member, same masks;
+    # what changes is what the takeover teaches:
+    #   _onset          TRANSIENT 0.4 -> 0.2 s and the first 1.5 s of the
+    #                   human core weighted x4 (the correction itself), the
+    #                   rest x2 -- "reward the first 1-2 s after the press".
+    #   _onset_relabel  the above PLUS the 0.5 s before each press RELABELLED
+    #                   with the human's chunk from the press (EIL / DAgger:
+    #                   the state that got corrected maps to the correction),
+    #                   weight x2, delivered through the loader's relabel_key.
+    #                   These anchors were weight-0 before -- the strongest
+    #                   supervision in the set, thrown away.
+    # Second weight = post-filter anchor count of that arm's dir (set at
+    # build time by build_hil_r8_weights_v2.py's census; the relabel arm keeps
+    # more anchors because relabelled stalls pass the pause filter).
+    "unitree_g1_pipette_3view_oft_ee_rel_crop3_hilr8_train_mix_onset": [
+        ("g1-pipette-3view-hil293-eerel-train", 253594.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+        ("g1-pipette-3view-hilr8-eerel-train-onset", 101569.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+    ],
+    "unitree_g1_pipette_3view_oft_ee_rel_crop3_hilr8_train_mix_onset_relabel": [
+        ("g1-pipette-3view-hil293-eerel-train", 253594.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+        ("g1-pipette-3view-hilr8-eerel-train-onset-relabel", 102118.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+    ],
+    # SCORING-ONLY mix (2026-09-16): the round-8 CORRECTION data, read as a
+    # holdout so eval_holdout can split its error by action.loss_weight into
+    # eval/mse_human, eval/mse_auto and eval/mse_masked. NOT a training mix and
+    # NOT a true holdout -- every frame here was trained on -- so it measures
+    # FIT, not generalisation. That is the point: the hil293 holdout can only
+    # reward an arm for changing less (which is why w1 < w2 < w4 < w8 and why
+    # head-only wins it outright), and this is the second axis that shows what
+    # each arm actually absorbed from the takeovers. Use the w2 dir for EVERY
+    # arm so the samples and the bucket boundaries are identical across the
+    # comparison -- the w1/w4/w8 dirs differ only in the weight VALUE, which
+    # would move the "human" bucket's threshold, not its membership.
+    "unitree_g1_pipette_3view_oft_ee_rel_crop3_hilr8_score_mix": [
+        ("g1-pipette-3view-hilr8-eerel-train", 1.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+    ],
+    # HIL v2 axes (2026-09-17): the same 58 episodes read through the
+    # onset-relabel dir, so eval_holdout can ALSO report eval/mse_onset (the
+    # first 1.5 s of each takeover, weight 4) and -- when the run sets
+    # relabel_key=action.right_ee_relabel -- eval/mse_relabel (the 0.5 s of
+    # pre-press anchors whose target is the human's path from the press). Score
+    # EVERY arm through this one dir, baselines included: the eval set, not the
+    # arm's own training data, defines the buckets.
+    "unitree_g1_pipette_3view_oft_ee_rel_crop3_hilr8_score_mix_v2": [
+        ("g1-pipette-3view-hilr8-eerel-train-onset-relabel", 1.0,
+         "unitree_g1_pipette_3view_oft_ee_rel_crop3"),
+    ],
     "unitree_g1_pipette_3view_oft_ee_eval_mix": [
         ("g1-pipette-3view-hil293-ee-eval", 1.0, "unitree_g1_pipette_3view_oft_ee"),
     ],
@@ -1859,6 +2213,157 @@ DATASET_NAMED_MIXTURES = {
          "unitree_g1_pipette_3view_oft_wrist8_rel_crop3"),
         ("g1-pipette-3view-20260819-plus21-wrist8rel-eval", 14833.0,
          "unitree_g1_pipette_3view_oft_wrist8_rel_crop3"),
+    ],
+    # Round 10: the five-step bench capture, 15% holdout by RECORDING (seed
+    # 1234, scratchpad build_5task_wrist18rel.py). One dataset per mix, so the
+    # weight is nominal; it is the post-pause-filter anchor count for the
+    # record. The eval dir carries a copy of the train rel statistics.
+    "unitree_g1_pipette_2view_oft_wrist18_rel_train_mix": [
+        ("g1-pipette-2view-5task-wrist18rel-train", 1.0,
+         "unitree_g1_pipette_2view_oft_wrist18_rel"),
+    ],
+    "unitree_g1_pipette_2view_oft_wrist18_rel_eval_mix": [
+        ("g1-pipette-2view-5task-wrist18rel-eval", 1.0,
+         "unitree_g1_pipette_2view_oft_wrist18_rel"),
+    ],
+    # Pipette pick ROUND 1: phase 1 (pipette pick) of the same capture ONLY.
+    # Round 10's recording-level split restricted to step 1: the 54 step-1
+    # episodes round 10 trained on / the 9 it held out (scratchpad
+    # build_5task_p1_split.py). Own rel statistics over the 54, copied into
+    # the eval dir; the left thumb_bend delta has zero span there (masked).
+    "unitree_g1_pipette_2view_p1_wrist18rel_train_mix": [
+        ("g1-pipette-2view-5task-wrist18rel-p1-train", 1.0,
+         "unitree_g1_pipette_2view_oft_wrist18_rel"),
+    ],
+    "unitree_g1_pipette_2view_p1_wrist18rel_eval_mix": [
+        ("g1-pipette-2view-5task-wrist18rel-p1-eval", 1.0,
+         "unitree_g1_pipette_2view_oft_wrist18_rel"),
+    ],
+    # Pipette pick ROUND 2: the same 54 / 9 step-1 episodes with the hands
+    # ABSOLUTE (wrists still chunk-relative). Own statistics over the 54,
+    # copied into the eval dir.
+    "unitree_g1_pipette_2view_p1_wrist12rel_hand6abs_train_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-hand6abs-p1-train", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_hand6abs"),
+    ],
+    "unitree_g1_pipette_2view_p1_wrist12rel_hand6abs_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-hand6abs-p1-eval", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_hand6abs"),
+    ],
+    # Pipette pick ROUND 3: round 2's split and labels plus the absolute arm
+    # joints. Own statistics over the 54, copied into the eval dir.
+    "unitree_g1_pipette_2view_p1_wrist12rel_hand6abs_joint14_train_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-hand6abs-joint14-p1-train", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_hand6abs_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p1_wrist12rel_hand6abs_joint14_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-hand6abs-joint14-p1-eval", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_hand6abs_joint14"),
+    ],
+    # TUBE PICK ROUND 1 (2026-09-29): phase 2 ("Pick up the tube from the blue
+    # rack on the left with the left hand.") ALONE, under pipette pick round
+    # 3's recipe and DataConfig. Round 10's recording-level split restricted
+    # to step 2: the 26 step-2 episodes round 10 trained on / the 5 it held
+    # out (130 146 162 174 176). Own statistics over the 26, copied into the
+    # eval dir (scratchpad build_5task_step_split.py + build_joint14_dirs.py).
+    "unitree_g1_pipette_2view_p2_wrist12rel_hand6abs_joint14_train_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-hand6abs-joint14-p2-train", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_hand6abs_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p2_wrist12rel_hand6abs_joint14_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-hand6abs-joint14-p2-eval", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_hand6abs_joint14"),
+    ],
+    # Tube pick round 1's REFERENCE: round 10's five-step GR00T twin scored on
+    # the SAME 5 held-out step-2 episodes under ITS OWN statistics (round 10's
+    # rel-mode file, byte copy, md5 d5dfcc7a...): the wrist18rel-p2-eval dir
+    # plus that file. Eval-only; never a training mix.
+    "unitree_g1_pipette_2view_p2_wrist18rel_r10stats_eval_mix": [
+        ("g1-pipette-2view-5task-wrist18rel-p2-eval-r10stats", 1.0,
+         "unitree_g1_pipette_2view_oft_wrist18_rel"),
+    ],
+    # PER-PHASE RECIPE v2 (2026-09-30): each phase of the five-step capture
+    # ALONE under unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14 (pick
+    # round 3 + LEFT THUMB relative). Round 10's recording-level split
+    # restricted to the phase; own statistics over the phase's train
+    # episodes, byte-copied into its eval dir. p2 = tube pick round 2, p3 =
+    # pipette aim, p4 = tube return, p5 = pipette return (round 1 each).
+    "unitree_g1_pipette_2view_p2_wrist12rel_lthumbrel_joint14_train_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p2-train", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p2_wrist12rel_lthumbrel_joint14_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p2-eval", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p3_wrist12rel_lthumbrel_joint14_train_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p3-train", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p3_wrist12rel_lthumbrel_joint14_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p3-eval", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_wrist12rel_lthumbrel_joint14_train_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p4-train", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_wrist12rel_lthumbrel_joint14_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p4-eval", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_wrist12rel_lthumbrel_joint14_train_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p5-train", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_wrist12rel_lthumbrel_joint14_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p5-eval", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    # Their REFERENCE: round 10's five-step GR00T twin on the same held-out
+    # episodes of phases 3-5 under its OWN statistics (as the p2 one above).
+    "unitree_g1_pipette_2view_p3_wrist18rel_r10stats_eval_mix": [
+        ("g1-pipette-2view-5task-wrist18rel-p3-eval-r10stats", 1.0,
+         "unitree_g1_pipette_2view_oft_wrist18_rel"),
+    ],
+    "unitree_g1_pipette_2view_p4_wrist18rel_r10stats_eval_mix": [
+        ("g1-pipette-2view-5task-wrist18rel-p4-eval-r10stats", 1.0,
+         "unitree_g1_pipette_2view_oft_wrist18_rel"),
+    ],
+    "unitree_g1_pipette_2view_p5_wrist18rel_r10stats_eval_mix": [
+        ("g1-pipette-2view-5task-wrist18rel-p5-eval-r10stats", 1.0,
+         "unitree_g1_pipette_2view_oft_wrist18_rel"),
+    ],
+    # PER-PHASE QwenOFT (2026-10-01): phases 3, 4 and 5 ALONE under pick round
+    # 3's DataConfig (wrists chunk-relative, BOTH hands absolute, + the
+    # absolute arm joints), which tube pick round 1 used for phase 2. For the
+    # QwenOFT runs of every phase: tube pick round 3 reuses the p2 mixes
+    # above; pipette aim / tube return / pipette return round 2 use these.
+    # Own statistics over each phase's train episodes, byte-copied into its
+    # eval dir (never the lthumbrel dirs' file: different left-thumb span).
+    "unitree_g1_pipette_2view_p3_wrist12rel_hand6abs_joint14_train_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-hand6abs-joint14-p3-train", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_hand6abs_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p3_wrist12rel_hand6abs_joint14_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-hand6abs-joint14-p3-eval", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_hand6abs_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_wrist12rel_hand6abs_joint14_train_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-hand6abs-joint14-p4-train", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_hand6abs_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_wrist12rel_hand6abs_joint14_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-hand6abs-joint14-p4-eval", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_hand6abs_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_wrist12rel_hand6abs_joint14_train_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-hand6abs-joint14-p5-train", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_hand6abs_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_wrist12rel_hand6abs_joint14_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-hand6abs-joint14-p5-eval", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_hand6abs_joint14"),
     ],
     # PURE-HIL arm of the R15 A/B: ONLY the 46 HG-DAgger correction
     # episodes (eps 78-123 of the merged R15 set, re-extracted to their
