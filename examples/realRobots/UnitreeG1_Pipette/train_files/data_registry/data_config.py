@@ -1734,6 +1734,11 @@ class Pipette2ViewWrist12RelLThumbRelJoint14DataConfig(Pipette2ViewWrist12RelHan
 
     SERVING (not built): wrists and joints as round 3; the left thumb row is an
       increment on the last commanded thumb (round 10's hand path).
+
+    FIVE-STEP v2 (2026-10-01): the same DataConfig on ALL FIVE steps at once
+      (one policy, the step's goal sentence as the language input), dirs
+      ``g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-{train,eval}`` =
+      round 10's split with own statistics.
     """
 
     action_keys = ["action.left_wrist_rel6", "action.right_wrist_rel6",
@@ -2333,6 +2338,50 @@ DATASET_NAMED_MIXTURES = {
     "unitree_g1_pipette_2view_p5_wrist18rel_r10stats_eval_mix": [
         ("g1-pipette-2view-5task-wrist18rel-p5-eval-r10stats", 1.0,
          "unitree_g1_pipette_2view_oft_wrist18_rel"),
+    ],
+    # Phase 1's counterpart (2026-10-01), so the five-step v2 policy meets round
+    # 10 on phase 1 too: the wrist18rel-p1-eval dir plus round 10's statistics.
+    "unitree_g1_pipette_2view_p1_wrist18rel_r10stats_eval_mix": [
+        ("g1-pipette-2view-5task-wrist18rel-p1-eval-r10stats", 1.0,
+         "unitree_g1_pipette_2view_oft_wrist18_rel"),
+    ],
+    # FIVE-STEP v2 (2026-10-01): ONE policy on ALL FIVE steps under the
+    # per-phase recipe v2's DataConfig (wrists + left thumb relative, right
+    # hand absolute, + the absolute arm joints). Dirs = round 10's
+    # recording-level split (202 / 35 episodes = the union of the five
+    # per-phase splits); own statistics over the 202, byte-copied into the
+    # eval dir (scratchpad allphase/build_5task_v2_dirs.py).
+    "unitree_g1_pipette_2view_5task_wrist12rel_lthumbrel_joint14_train_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-train", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_5task_wrist12rel_lthumbrel_joint14_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-eval", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    # Its per-phase SCORING mixes: each phase's held-out episodes (the dirs
+    # every per-phase run was scored on) under the FIVE-STEP statistics, so
+    # indices [0, 480) are the per-phase runs' own holdout samples, scored
+    # under the policy's normalisation. Eval-only; never a training mix.
+    "unitree_g1_pipette_2view_p1_wrist12rel_lthumbrel_joint14_5taskstats_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p1-eval-5taskstats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p2_wrist12rel_lthumbrel_joint14_5taskstats_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p2-eval-5taskstats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p3_wrist12rel_lthumbrel_joint14_5taskstats_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p3-eval-5taskstats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_wrist12rel_lthumbrel_joint14_5taskstats_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p4-eval-5taskstats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_wrist12rel_lthumbrel_joint14_5taskstats_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p5-eval-5taskstats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
     ],
     # PER-PHASE QwenOFT (2026-10-01): phases 3, 4 and 5 ALONE under pick round
     # 3's DataConfig (wrists chunk-relative, BOTH hands absolute, + the
