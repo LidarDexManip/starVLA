@@ -1812,7 +1812,10 @@ class LeRobotSingleDataset(Dataset):
         step_images = []
         for video_key, size in zip(keys, sizes):
             image = data[video_key][0]
-            image = Image.fromarray(image).resize(size)
+            # sizes are (h, w); PIL wants (w, h). Every config was square until
+            # five-step v5's 224 x 398 ego view (2026-10-08), which this turned
+            # into a 398 x 224 portrait.
+            image = Image.fromarray(image).resize((size[1], size[0]))
             step_images.append(image)
 
         language = data[self.modality_keys["language"][0]][0]
