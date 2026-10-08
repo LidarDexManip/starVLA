@@ -2282,6 +2282,16 @@ DATASET_NAMED_MIXTURES = {
         ("g1-pipette-2view-5task-wrist18rel-p2-eval-r10stats", 1.0,
          "unitree_g1_pipette_2view_oft_wrist18_rel"),
     ],
+    # Five-task v2: one shared statistics file and mixed relative/absolute
+    # 32-D action contract. Also required to serve the published checkpoint.
+    "unitree_g1_pipette_2view_5task_wrist12rel_lthumbrel_joint14_train_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-train", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_5task_wrist12rel_lthumbrel_joint14_eval_mix": [
+        ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-eval", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
     # PER-PHASE RECIPE v2 (2026-09-30): each phase of the five-step capture
     # ALONE under unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14 (pick
     # round 3 + LEFT THUMB relative). Round 10's recording-level split
