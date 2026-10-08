@@ -558,7 +558,8 @@ class CosmosGR00T_N1d7(baseframework):
                 logger.error(f"[camera contract] {e}; serving views unresized")
                 sizes = None
             if sizes is not None:
-                images = [[im.resize(sz) for im, sz in zip(views, sizes)]
+                # sizes are (h, w); PIL wants (w, h) (square views hid this)
+                images = [[im.resize((sz[1], sz[0])) for im, sz in zip(views, sizes)]
                           for views in images]
 
         vl_embeds, image_mask, attn_mask = self._encode_vl(images, instructions)

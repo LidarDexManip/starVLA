@@ -1750,6 +1750,118 @@ class Pipette2ViewWrist12RelLThumbRelJoint14DataConfig(Pipette2ViewWrist12RelHan
     action_normalization_modes = {k: "q99" for k in action_keys}
 
 
+class _PerViewGeometry:
+    """Per-view image geometry for the five-step v5 runs (2026-10-08): each view is
+    resized to its own PRE_HW (h, w), then 95 % random-cropped (train) / centre-
+    cropped (eval) to VIEW_HW (h, w); +-5 deg rotation and the colour jitter /
+    temperature of the GR00T rounds (one colour draw shared by the views when they are
+    the same size, one per view otherwise). VIEW_HW = PRE_HW x 0.95 exactly.
+
+    SQUARE_VIEWS are stored in the dataset as the CENTRE SQUARE of a wider camera
+    (convert_g1_recording_to_lerobot.py::crop_box: wrist_left 1920x1080 ->
+    x[420:1500]); serve_view_preprocess takes that square itself whenever it gets a
+    non-square frame, so a live 1920x1080 frame and an already-square replay frame
+    reach the model framed exactly as in training, with or without a bridge
+    view_crop."""
+
+    PRE_HW: dict = {}
+    VIEW_HW: dict = {}
+    SQUARE_VIEWS: tuple = ()
+
+    def _check_geometry(self):
+        for k in self.video_keys:
+            (ph, pw), (vh, vw) = self.PRE_HW[k], self.VIEW_HW[k]
+            assert (int(ph * self.CROP_FRAC), int(pw * self.CROP_FRAC)) == (vh, vw), (k, ph, pw, vh, vw)
+
+    def serve_view_preprocess(self, images):
+        """Serve-time views == this config's EVAL chain (centre square for
+        SQUARE_VIEWS, resize to PRE_HW, centre crop VIEW_HW -- torchvision's
+        CenterCrop offsets). One uint8 HWC array per view, video_keys order."""
+        from PIL import Image as _Image
+        self._check_geometry()
+        out = []
+        for key, im in zip(self.video_keys, images):
+            a = np.asarray(im)
+            if key in self.SQUARE_VIEWS and a.shape[0] != a.shape[1]:
+                h, w = a.shape[:2]
+                side = min(h, w)
+                y0, x0 = (h - side) // 2, (w - side) // 2
+                a = a[y0:y0 + side, x0:x0 + side]
+            (ph, pw), (vh, vw) = self.PRE_HW[key], self.VIEW_HW[key]
+            a = np.asarray(_Image.fromarray(a).resize((pw, ph), _Image.BILINEAR))
+            top, left = int(round((ph - vh) / 2.0)), int(round((pw - vw) / 2.0))
+            out.append(a[top:top + vh, left:left + vw])
+        return out
+
+    def transform(self):
+        self._check_geometry()
+        per_view = []
+        for key in self.video_keys:
+            ph, pw = self.PRE_HW[key]
+            per_view += [
+                VideoToTensor(apply_to=[key]),
+                VideoResize(apply_to=[key], height=ph, width=pw, interpolation="linear"),
+                VideoRandomRotation(apply_to=[key], degrees=self.ROT_DEG, interpolation="linear"),
+                VideoCrop(apply_to=[key], height=ph, width=pw, scale=self.CROP_FRAC),
+            ]
+        # colour: ONE draw for all views when they share a size (v4's behaviour);
+        # VideoColorJitter stacks its views, so views of different sizes get one
+        # independent draw each
+        groups = ([list(self.video_keys)] if len({self.VIEW_HW[k] for k in self.video_keys}) == 1
+                  else [[k] for k in self.video_keys])
+        colour = []
+        for g in groups:
+            colour += [VideoColorJitter(apply_to=g, brightness=0.3, contrast=0.4, saturation=0.5, hue=0.08),
+                       VideoColorTemperature(apply_to=g, strength=0.15)]
+        return ComposedModalityTransform(
+            transforms=[
+                *per_view,
+                *colour,
+                *[VideoToNumpy(apply_to=g) for g in groups],   # also stacks its views
+                StateActionToTensor(apply_to=self.state_keys + self.action_keys),
+                StateActionTransform(apply_to=self.state_keys,
+                                     normalization_modes={key: "q99" for key in self.state_keys}),
+                StateActionTransform(apply_to=self.action_keys,
+                                     normalization_modes=dict(self.action_normalization_modes)),
+            ]
+        )
+
+
+class Pipette2ViewPI05Sq224Wrist12RelLThumbRelJoint14DataConfig(
+        _PerViewGeometry, Pipette2ViewWrist12RelLThumbRelJoint14DataConfig):
+    """Five-step v5, PI0.5 run (2026-10-08): five-step v4's data, split and 32-D
+    action (wrists rel6, LEFT thumb rel, right hand absolute, + 14 absolute arm
+    joints for the IK warm start) at PI0.5's own 224 x 224, NO STATE INPUT (the
+    yaml sets include_state false; the state keys stay because the rel6 / thumb
+    labels are anchored at state.*_cmd6 / state.left_hand_cmd).
+
+    VIEWS (user 2026-10-08): ego `video.rgb` 1280x720 resized STRAIGHT to the
+    square (no letterbox), wrist `video.wrist_left` = the centre 1080 square,
+    resized; both 236 -> crop 224. PI0.5's resize_with_pad to its 224 input is
+    then a no-op. The model has 3 image slots; the third is masked."""
+
+    PRE_HW = {"video.rgb": (236, 236), "video.wrist_left": (236, 236)}
+    VIEW_HW = {"video.rgb": (224, 224), "video.wrist_left": (224, 224)}
+    SQUARE_VIEWS = ("video.wrist_left",)
+
+
+class Pipette2ViewOFTEgo398Wrist256Wrist12RelLThumbRelJoint14DataConfig(
+        _PerViewGeometry, Pipette2ViewWrist12RelLThumbRelJoint14DataConfig):
+    """Five-step v5, QwenOFT run (2026-10-08): five-step v4's data, split, 32-D
+    action and 59-D state (WITH state: the yaml sets include_state true), the
+    QwenOFT head.
+
+    VIEWS (user 2026-10-08): ego `video.rgb` 1280x720 KEEPS 16:9 -- resized to
+    236 x 419 (h x w) -> crop 224 x 398; wrist `video.wrist_left` = the centre
+    1080 square, 270 -> crop 256 (v4's wrist geometry). Qwen3-VL tokenises in 32 px
+    cells, so its processor rounds the ego view to 224 x 384 (7 x 12 = 84 tokens);
+    the wrist view is 8 x 8 = 64."""
+
+    PRE_HW = {"video.rgb": (236, 419), "video.wrist_left": (270, 270)}
+    VIEW_HW = {"video.rgb": (224, 398), "video.wrist_left": (256, 256)}
+    SQUARE_VIEWS = ("video.wrist_left",)
+
+
 ROBOT_TYPE_CONFIG_MAP = {
     "unitree_g1_pipette_n1d7": PipetteTipG1GR00TN1d7DataConfig(),
     "unitree_g1_pipette_armhand_n1d7": PipetteTipG1ArmHandOnlyDataConfig(),
@@ -1815,6 +1927,12 @@ ROBOT_TYPE_CONFIG_MAP = {
     # (tube pick round 2; phases 3, 4, 5 round 1). See the class.
     "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14":
         Pipette2ViewWrist12RelLThumbRelJoint14DataConfig(),
+    # Five-step v5 (2026-10-08): v4's labels at new view geometry -- PI0.5 (both
+    # views 224 square, no state) and QwenOFT (ego 224x398, wrist 256, state).
+    "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14":
+        Pipette2ViewPI05Sq224Wrist12RelLThumbRelJoint14DataConfig(),
+    "unitree_g1_pipette_2view_ego398w256_wrist12rel_lthumbrel_joint14":
+        Pipette2ViewOFTEgo398Wrist256Wrist12RelLThumbRelJoint14DataConfig(),
     # Round 12: round 11 with the wrist views centre-cropped 1080 -> 720
     # BEFORE the 448 resize. Same three views, same token count.
     "unitree_g1_pipette_3view_nohist_crop720_n1d7":
@@ -2382,6 +2500,262 @@ DATASET_NAMED_MIXTURES = {
     "unitree_g1_pipette_2view_p5_wrist12rel_lthumbrel_joint14_5taskstats_eval_mix": [
         ("g1-pipette-2view-5task-wrist12rel-lthumbrel-joint14-p5-eval-5taskstats", 1.0,
          "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    # FIVE-STEP v3 (2026-10-07): the v2 recipe (same DataConfig) retrained on the
+    # 447-episode capture = 0924/0925 + the 2026-10-07 whole five-step chains and
+    # tube pairs. Round 10's recording-level split for episodes 0-236 verbatim,
+    # the new recordings split by recording (15 %, seed 1234): 379 / 68 episodes.
+    # Own statistics over the 379, byte-copied into the eval dir
+    # (scratchpad v3/build_5task_v3_dirs.py).
+    "unitree_g1_pipette_2view_5task447_wrist12rel_lthumbrel_joint14_train_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-train", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_5task447_wrist12rel_lthumbrel_joint14_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-eval", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    # Its per-phase SCORING mixes. v3stats: each phase's OLD held-out episodes
+    # (the dirs every per-phase run and v2 were scored on) under the v3
+    # statistics, so [0, 480) are the very samples v2 scored. eval1007: each
+    # phase's NEW held-out episodes (2026-10-07 recordings) under v3's and under
+    # v2's statistics, so both policies meet on the new chains too. Eval-only.
+    "unitree_g1_pipette_2view_p1_wrist12rel_lthumbrel_joint14_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p1-eval-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p2_wrist12rel_lthumbrel_joint14_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p2-eval-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p3_wrist12rel_lthumbrel_joint14_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p3-eval-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_wrist12rel_lthumbrel_joint14_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p4-eval-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_wrist12rel_lthumbrel_joint14_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p5-eval-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p1_wrist12rel_lthumbrel_joint14_eval1007_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p1-eval1007-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p1_wrist12rel_lthumbrel_joint14_eval1007_v2stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p1-eval1007-v2stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p2_wrist12rel_lthumbrel_joint14_eval1007_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p2-eval1007-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p2_wrist12rel_lthumbrel_joint14_eval1007_v2stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p2-eval1007-v2stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p3_wrist12rel_lthumbrel_joint14_eval1007_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p3-eval1007-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p3_wrist12rel_lthumbrel_joint14_eval1007_v2stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p3-eval1007-v2stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_wrist12rel_lthumbrel_joint14_eval1007_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p4-eval1007-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_wrist12rel_lthumbrel_joint14_eval1007_v2stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p4-eval1007-v2stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_wrist12rel_lthumbrel_joint14_eval1007_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p5-eval1007-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_wrist12rel_lthumbrel_joint14_eval1007_v2stats_eval_mix": [
+        ("g1-pipette-2view-5task447-wrist12rel-lthumbrel-joint14-p5-eval1007-v2stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    # FIVE-STEP v4 (2026-10-08): five-step v3 on dataset release v1.2, the
+    # operator-reviewed pipette pick | tube pick cut (only the step1 / step2
+    # episodes of the 30 2026-10-07 chains differ from v1.1). v3's split episode
+    # for episode; own statistics over the 379 train episodes
+    # (scratchpad v4/build_5task_v4_dirs.py).
+    "unitree_g1_pipette_2view_5task447v12_wrist12rel_lthumbrel_joint14_train_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-train", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_5task447v12_wrist12rel_lthumbrel_joint14_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-eval", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    # Its per-phase SCORING mixes. v4stats: each phase's OLD held-out episodes
+    # under the v4 statistics ([0, 480) = the samples v2 and v3 scored).
+    # eval1007v12: each phase's NEW held-out episodes AS CUT IN v1.2 under v4's
+    # and v3's statistics (phases 1-2 differ from the v1.1 eval1007 dirs).
+    "unitree_g1_pipette_2view_p1_wrist12rel_lthumbrel_joint14_v4stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p1-eval-v4stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p2_wrist12rel_lthumbrel_joint14_v4stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p2-eval-v4stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p3_wrist12rel_lthumbrel_joint14_v4stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p3-eval-v4stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_wrist12rel_lthumbrel_joint14_v4stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p4-eval-v4stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_wrist12rel_lthumbrel_joint14_v4stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p5-eval-v4stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p1_wrist12rel_lthumbrel_joint14_eval1007v12_v4stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p1-eval1007-v4stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p1_wrist12rel_lthumbrel_joint14_eval1007v12_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p1-eval1007-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p2_wrist12rel_lthumbrel_joint14_eval1007v12_v4stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p2-eval1007-v4stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p2_wrist12rel_lthumbrel_joint14_eval1007v12_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p2-eval1007-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p3_wrist12rel_lthumbrel_joint14_eval1007v12_v4stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p3-eval1007-v4stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p3_wrist12rel_lthumbrel_joint14_eval1007v12_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p3-eval1007-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_wrist12rel_lthumbrel_joint14_eval1007v12_v4stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p4-eval1007-v4stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_wrist12rel_lthumbrel_joint14_eval1007v12_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p4-eval1007-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_wrist12rel_lthumbrel_joint14_eval1007v12_v4stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p5-eval1007-v4stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_wrist12rel_lthumbrel_joint14_eval1007v12_v3stats_eval_mix": [
+        ("g1-pipette-2view-5task447v12-wrist12rel-lthumbrel-joint14-p5-eval1007-v3stats", 1.0,
+         "unitree_g1_pipette_2view_wrist12rel_lthumbrel_joint14"),
+    ],
+    # FIVE-STEP v5 (2026-10-08): v4's data (release v1.2), split and labels at new
+    # view geometry, two parallel runs: PI0.5 (ZD1; 224 square views, no state) and
+    # QwenOFT (SD1; ego 224x398, wrist 256, with state). Own dirs (data/videos
+    # symlinked to the v1.2 wrist18rel split dirs) and own statistics per run.
+    "unitree_g1_pipette_2view_5task447v12_pi05sq224_train_mix": [
+        ("g1-pipette-2view-5task447v12-pi05sq224-train", 1.0,
+         "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_5task447v12_pi05sq224_eval_mix": [
+        ("g1-pipette-2view-5task447v12-pi05sq224-eval", 1.0,
+         "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p1_pi05sq224_eval_mix": [
+        ("g1-pipette-2view-5task447v12-pi05sq224-p1-eval", 1.0,
+         "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p1_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-2view-5task447v12-pi05sq224-p1-eval1007", 1.0,
+         "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p2_pi05sq224_eval_mix": [
+        ("g1-pipette-2view-5task447v12-pi05sq224-p2-eval", 1.0,
+         "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p2_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-2view-5task447v12-pi05sq224-p2-eval1007", 1.0,
+         "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p3_pi05sq224_eval_mix": [
+        ("g1-pipette-2view-5task447v12-pi05sq224-p3-eval", 1.0,
+         "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p3_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-2view-5task447v12-pi05sq224-p3-eval1007", 1.0,
+         "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_pi05sq224_eval_mix": [
+        ("g1-pipette-2view-5task447v12-pi05sq224-p4-eval", 1.0,
+         "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-2view-5task447v12-pi05sq224-p4-eval1007", 1.0,
+         "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_pi05sq224_eval_mix": [
+        ("g1-pipette-2view-5task447v12-pi05sq224-p5-eval", 1.0,
+         "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-2view-5task447v12-pi05sq224-p5-eval1007", 1.0,
+         "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_5task447v12_ego398w256_train_mix": [
+        ("g1-pipette-2view-5task447v12-ego398w256-train", 1.0,
+         "unitree_g1_pipette_2view_ego398w256_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_5task447v12_ego398w256_eval_mix": [
+        ("g1-pipette-2view-5task447v12-ego398w256-eval", 1.0,
+         "unitree_g1_pipette_2view_ego398w256_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p1_ego398w256_eval_mix": [
+        ("g1-pipette-2view-5task447v12-ego398w256-p1-eval", 1.0,
+         "unitree_g1_pipette_2view_ego398w256_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p1_ego398w256_eval1007v12_eval_mix": [
+        ("g1-pipette-2view-5task447v12-ego398w256-p1-eval1007", 1.0,
+         "unitree_g1_pipette_2view_ego398w256_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p2_ego398w256_eval_mix": [
+        ("g1-pipette-2view-5task447v12-ego398w256-p2-eval", 1.0,
+         "unitree_g1_pipette_2view_ego398w256_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p2_ego398w256_eval1007v12_eval_mix": [
+        ("g1-pipette-2view-5task447v12-ego398w256-p2-eval1007", 1.0,
+         "unitree_g1_pipette_2view_ego398w256_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p3_ego398w256_eval_mix": [
+        ("g1-pipette-2view-5task447v12-ego398w256-p3-eval", 1.0,
+         "unitree_g1_pipette_2view_ego398w256_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p3_ego398w256_eval1007v12_eval_mix": [
+        ("g1-pipette-2view-5task447v12-ego398w256-p3-eval1007", 1.0,
+         "unitree_g1_pipette_2view_ego398w256_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_ego398w256_eval_mix": [
+        ("g1-pipette-2view-5task447v12-ego398w256-p4-eval", 1.0,
+         "unitree_g1_pipette_2view_ego398w256_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p4_ego398w256_eval1007v12_eval_mix": [
+        ("g1-pipette-2view-5task447v12-ego398w256-p4-eval1007", 1.0,
+         "unitree_g1_pipette_2view_ego398w256_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_ego398w256_eval_mix": [
+        ("g1-pipette-2view-5task447v12-ego398w256-p5-eval", 1.0,
+         "unitree_g1_pipette_2view_ego398w256_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_2view_p5_ego398w256_eval1007v12_eval_mix": [
+        ("g1-pipette-2view-5task447v12-ego398w256-p5-eval1007", 1.0,
+         "unitree_g1_pipette_2view_ego398w256_wrist12rel_lthumbrel_joint14"),
     ],
     # PER-PHASE QwenOFT (2026-10-01): phases 3, 4 and 5 ALONE under pick round
     # 3's DataConfig (wrists chunk-relative, BOTH hands absolute, + the
