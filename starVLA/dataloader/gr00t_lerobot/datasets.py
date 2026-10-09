@@ -1833,7 +1833,20 @@ class LeRobotSingleDataset(Dataset):
 
         if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
             state = []
-            for state_key in self.modality_keys.get("state", []):
+            state_keys = list(self.modality_keys.get("state", []))
+            # state_input_keys (2026-10-09): feed the model ONLY these state keys, in
+            # this order. The DataConfig keeps its other state keys loaded and
+            # normalised for the labels (action_mode rel anchors), but they never
+            # reach the model -- e.g. the focus window without the proprio.
+            input_keys = self.data_cfg.get("state_input_keys", None)
+            if input_keys:
+                input_keys = [str(k) for k in input_keys]
+                missing = [k for k in input_keys if k not in state_keys]
+                if missing:
+                    raise KeyError(f"state_input_keys {missing} are not state keys of this "
+                                   f"DataConfig ({state_keys})")
+                state_keys = input_keys
+            for state_key in state_keys:
                 state.append(data[state_key])
             if not state:
                 import warnings
