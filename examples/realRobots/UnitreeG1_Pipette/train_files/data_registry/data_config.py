@@ -1862,6 +1862,65 @@ class Pipette2ViewOFTEgo398Wrist256Wrist12RelLThumbRelJoint14DataConfig(
     SQUARE_VIEWS = ("video.wrist_left",)
 
 
+class Pipette2ViewPI05EgoFocusSq224Wrist12RelLThumbRelJoint14DataConfig(
+        _PerViewGeometry, Pipette2ViewWrist12RelLThumbRelJoint14DataConfig):
+    """Five-step v6, PI0.5 EGO + FOCUS (2026-10-09): the v5 PI0.5 run (v4's data,
+    split and 32-D labels, NO STATE INPUT) with the eye-in-hand view REPLACED by the
+    FOCUS view (user 2026-10-09: "just use the ego and focus view, no need to have
+    the wrist cam view as the input").
+
+    `video.focus` (dataset v1.2 + focus, observation.images.focus): per frame a
+    300 x 300 window of the 1280x720 ego frame around the phase's target -- the
+    pipette holder (phases 1, 5), the blue tube rack (2, 4), the opening of the
+    left-hand tube (3) -- tracked offline (OWLv2 + SAM 2.1, hold-when-occluded,
+    EMA), stored resized to 224 x 224. Ego `video.rgb` squashed to the square as in
+    v5. Both 236 -> crop 224 (one shared colour draw: the focus view is a crop of
+    the ego frame). Serving needs a causal tracker that reproduces these windows."""
+
+    video_keys = ["video.rgb", "video.focus"]
+    PRE_HW = {"video.rgb": (236, 236), "video.focus": (236, 236)}
+    VIEW_HW = {"video.rgb": (224, 224), "video.focus": (224, 224)}
+    SQUARE_VIEWS = ()
+
+
+class Pipette2ViewPI05EgoFocusXYSq224Wrist12RelLThumbRelJoint14DataConfig(
+        Pipette2ViewPI05EgoFocusSq224Wrist12RelLThumbRelJoint14DataConfig):
+    """Five-step v6 run B (2026-10-09): run A (ego + focus views, v5's labels) PLUS the
+    focus FRAMING as model input (user: "train a second run (B) that adds the window
+    corner and the flag"): `state.focus_corner` = the 300 px window's top-left (x0, y0)
+    in 1280x720 ego pixels (the size is fixed, so it fixes the window), and
+    `state.focus_following` = 1 while the window follows the target, 0 while it holds
+    its last clear position (a hand covers the target).
+
+    Only those two go to the model -- the yaml's `state_input_keys` -- as PI0.5's
+    discrete state tokens (q99-normalised, 256 bins, "Task: ..., State: x y f;"); the
+    proprio / command-anchor state keys stay loaded for the rel labels only, as in A."""
+
+    state_keys = (Pipette2ViewPI05EgoFocusSq224Wrist12RelLThumbRelJoint14DataConfig.state_keys
+                  + ["state.focus_corner", "state.focus_following"])
+    # serving splits the 62-D state statistics by these (policy_norm_processor); training reads
+    # the dims from the dataset's modality.json and never needed them
+    state_key_dims = {**Pipette2ViewPI05EgoFocusSq224Wrist12RelLThumbRelJoint14DataConfig.state_key_dims,
+                      "state.focus_corner": 2, "state.focus_following": 1}
+
+
+class Pipette3ViewPI05EgoWristFocusSq224Wrist12RelLThumbRelJoint14DataConfig(
+        _PerViewGeometry, Pipette2ViewWrist12RelLThumbRelJoint14DataConfig):
+    """Five-step v6 run C (2026-10-09): run A (ego + focus, v5's labels, NO STATE INPUT) with
+    the eye-in-hand view BACK (user: "after A, train one more with the wrist cam view").
+
+    Views in PI0.5's three image slots: ego `video.rgb` (base) and wrist `video.wrist_left`
+    (left wrist) exactly as in v5 -- ego squashed to the square, wrist = the centre 1080
+    square -- and `video.focus` (the slot v5 and A left masked; A put focus in the wrist
+    slot). PI0.5 embeds all three slots whether or not they are filled, so this costs no
+    more compute than A or v5. All 236 -> crop 224, one shared colour draw."""
+
+    video_keys = ["video.rgb", "video.wrist_left", "video.focus"]
+    PRE_HW = {"video.rgb": (236, 236), "video.wrist_left": (236, 236), "video.focus": (236, 236)}
+    VIEW_HW = {"video.rgb": (224, 224), "video.wrist_left": (224, 224), "video.focus": (224, 224)}
+    SQUARE_VIEWS = ("video.wrist_left",)
+
+
 ROBOT_TYPE_CONFIG_MAP = {
     "unitree_g1_pipette_n1d7": PipetteTipG1GR00TN1d7DataConfig(),
     "unitree_g1_pipette_armhand_n1d7": PipetteTipG1ArmHandOnlyDataConfig(),
@@ -1933,6 +1992,15 @@ ROBOT_TYPE_CONFIG_MAP = {
         Pipette2ViewPI05Sq224Wrist12RelLThumbRelJoint14DataConfig(),
     "unitree_g1_pipette_2view_ego398w256_wrist12rel_lthumbrel_joint14":
         Pipette2ViewOFTEgo398Wrist256Wrist12RelLThumbRelJoint14DataConfig(),
+    # Five-step v6 (2026-10-09): the v5 PI0.5 recipe with ego + FOCUS views (no wrist).
+    "unitree_g1_pipette_egofocus_pi05sq224_wrist12rel_lthumbrel_joint14":
+        Pipette2ViewPI05EgoFocusSq224Wrist12RelLThumbRelJoint14DataConfig(),
+    # ... run B: + the focus window's corner and following flag as discrete state tokens.
+    "unitree_g1_pipette_egofocusxy_pi05sq224_wrist12rel_lthumbrel_joint14":
+        Pipette2ViewPI05EgoFocusXYSq224Wrist12RelLThumbRelJoint14DataConfig(),
+    # ... run C: A + the wrist view again (ego, wrist, focus = PI0.5's three slots).
+    "unitree_g1_pipette_egowristfocus_pi05sq224_wrist12rel_lthumbrel_joint14":
+        Pipette3ViewPI05EgoWristFocusSq224Wrist12RelLThumbRelJoint14DataConfig(),
     # Round 12: round 11 with the wrist views centre-cropped 1080 -> 720
     # BEFORE the 448 resize. Same three views, same token count.
     "unitree_g1_pipette_3view_nohist_crop720_n1d7":
@@ -2708,6 +2776,93 @@ DATASET_NAMED_MIXTURES = {
     "unitree_g1_pipette_2view_p5_pi05sq224_eval1007v12_eval_mix": [
         ("g1-pipette-2view-5task447v12-pi05sq224-p5-eval1007", 1.0,
          "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    # Five-step v6 (2026-10-09): ego + FOCUS (dataset v1.2 + focus), v4's split.
+    "unitree_g1_pipette_egofocus_5task447v12_pi05sq224_train_mix": [
+        ("g1-pipette-egofocus-5task447v12-pi05sq224-train", 1.0,
+         "unitree_g1_pipette_egofocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocus_5task447v12_pi05sq224_eval_mix": [
+        ("g1-pipette-egofocus-5task447v12-pi05sq224-eval", 1.0,
+         "unitree_g1_pipette_egofocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocus_p1_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocus-5task447v12-pi05sq224-p1-eval1007", 1.0,
+         "unitree_g1_pipette_egofocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocus_p2_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocus-5task447v12-pi05sq224-p2-eval1007", 1.0,
+         "unitree_g1_pipette_egofocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocus_p3_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocus-5task447v12-pi05sq224-p3-eval1007", 1.0,
+         "unitree_g1_pipette_egofocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocus_p4_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocus-5task447v12-pi05sq224-p4-eval1007", 1.0,
+         "unitree_g1_pipette_egofocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocus_p5_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocus-5task447v12-pi05sq224-p5-eval1007", 1.0,
+         "unitree_g1_pipette_egofocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    # Five-step v6 run B (2026-10-09): + focus corner / following flag as state tokens.
+    # five-step v6 run C: A's dataset dirs (they carry rgb, wrist_left and focus) + C's config
+    "unitree_g1_pipette_egowristfocus_5task447v12_pi05sq224_train_mix": [
+        ("g1-pipette-egofocus-5task447v12-pi05sq224-train", 1.0,
+         "unitree_g1_pipette_egowristfocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egowristfocus_5task447v12_pi05sq224_eval_mix": [
+        ("g1-pipette-egofocus-5task447v12-pi05sq224-eval", 1.0,
+         "unitree_g1_pipette_egowristfocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egowristfocus_p1_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocus-5task447v12-pi05sq224-p1-eval1007", 1.0,
+         "unitree_g1_pipette_egowristfocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egowristfocus_p2_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocus-5task447v12-pi05sq224-p2-eval1007", 1.0,
+         "unitree_g1_pipette_egowristfocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egowristfocus_p3_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocus-5task447v12-pi05sq224-p3-eval1007", 1.0,
+         "unitree_g1_pipette_egowristfocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egowristfocus_p4_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocus-5task447v12-pi05sq224-p4-eval1007", 1.0,
+         "unitree_g1_pipette_egowristfocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egowristfocus_p5_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocus-5task447v12-pi05sq224-p5-eval1007", 1.0,
+         "unitree_g1_pipette_egowristfocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocusxy_5task447v12_pi05sq224_train_mix": [
+        ("g1-pipette-egofocusxy-5task447v12-pi05sq224-train", 1.0,
+         "unitree_g1_pipette_egofocusxy_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocusxy_5task447v12_pi05sq224_eval_mix": [
+        ("g1-pipette-egofocusxy-5task447v12-pi05sq224-eval", 1.0,
+         "unitree_g1_pipette_egofocusxy_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocusxy_p1_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocusxy-5task447v12-pi05sq224-p1-eval1007", 1.0,
+         "unitree_g1_pipette_egofocusxy_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocusxy_p2_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocusxy-5task447v12-pi05sq224-p2-eval1007", 1.0,
+         "unitree_g1_pipette_egofocusxy_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocusxy_p3_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocusxy-5task447v12-pi05sq224-p3-eval1007", 1.0,
+         "unitree_g1_pipette_egofocusxy_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocusxy_p4_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocusxy-5task447v12-pi05sq224-p4-eval1007", 1.0,
+         "unitree_g1_pipette_egofocusxy_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocusxy_p5_pi05sq224_eval1007v12_eval_mix": [
+        ("g1-pipette-egofocusxy-5task447v12-pi05sq224-p5-eval1007", 1.0,
+         "unitree_g1_pipette_egofocusxy_pi05sq224_wrist12rel_lthumbrel_joint14"),
     ],
     "unitree_g1_pipette_2view_5task447v12_ego398w256_train_mix": [
         ("g1-pipette-2view-5task447v12-ego398w256-train", 1.0,

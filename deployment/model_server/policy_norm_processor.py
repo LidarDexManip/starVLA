@@ -24,6 +24,7 @@ training — there is no second source of truth for normalization math.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -444,7 +445,27 @@ class PolicyNormProcessor:
     # ------------------------------------------------------------------
     # Forward path (env proprioception → model input)
     # ------------------------------------------------------------------
-    def apply_state(self, raw_state: np.ndarray) -> np.ndarray:
+    @property
+    def state_input_keys(self) -> List[str]:
+        """The state keys the MODEL was fed, in order: the yaml's ``state_input_keys``
+        (datasets.py packs only those when include_state), else every DataConfig state
+        key; empty when the checkpoint was trained without state input."""
+        vla = (self._model_cfg.get("datasets", {}) or {}).get("vla_data", {}) or {}
+        if "include_state" not in vla:
+            # config.yaml is the trainer's ACCESSED-keys snapshot, and these two are read in
+            # the dataloader WORKERS (_pack_sample), so they never reach it (five-step v6 run
+            # B's config.yaml has neither); config.full.yaml beside it has every key.
+            full = Path(self._ckpt_path).parents[1] / "config.full.yaml"
+            if full.is_file():
+                from omegaconf import OmegaConf
+                vla = (OmegaConf.to_container(OmegaConf.load(str(full)), resolve=True)
+                       .get("datasets", {}) or {}).get("vla_data", {}) or {}
+        if not vla.get("include_state", False):
+            return []
+        keys = vla.get("state_input_keys") or self._state_keys
+        return [str(k) for k in keys]
+
+    def apply_state(self, raw_state: np.ndarray, keys: Optional[Sequence[str]] = None) -> np.ndarray:
         """Normalize proprioception with the TRAINING pipeline.
 
         The module docstring has promised this method since the class was
@@ -455,13 +476,16 @@ class PolicyNormProcessor:
 
         Args:
             raw_state: ``(T, D)`` or ``(D,)`` in ENV units (radians, registers),
-                laid out as ``state_keys`` concatenated in DataConfig order.
+                laid out as ``keys`` concatenated in that order.
                 ``T`` is the state history depth; every frame is normalised
                 with the same per-key statistics, exactly as the dataloader
                 does when ``state_indices`` has more than one entry.
 
         Returns:
             The same shape, normalised — ready to hand to the action head.
+            keys: The state keys in ``raw_state``, in order (default: every
+                DataConfig state key). A subset is normalised with the same
+                per-key statistics -- e.g. ``state_input_keys``.
 
         Only the state-side transforms run. Video transforms are skipped
         (there are no video keys in ``data``), and the state ones document
@@ -481,22 +505,26 @@ class PolicyNormProcessor:
         if arr.ndim != 2:
             raise ValueError(f"Expected (T, D) or (D,); got shape {arr.shape}")
 
-        sum_dims = sum(self._state_key_dims.get(k, 1) for k in self._state_keys)
+        keys = list(self._state_keys if keys is None else keys)
+        unknown = [k for k in keys if k not in self._state_key_dims and k not in self._state_keys]
+        if unknown:
+            raise KeyError(f"{unknown} are not state keys of this checkpoint ({self._state_keys})")
+        sum_dims = sum(self._state_key_dims.get(k, 1) for k in keys)
         if arr.shape[-1] != sum_dims:
             raise ValueError(
                 f"state has {arr.shape[-1]} dims but the DataConfig's state "
-                f"keys require {sum_dims}. state_keys={self._state_keys}, "
+                f"keys require {sum_dims}. keys={keys}, "
                 f"state_key_dims={self._state_key_dims}"
             )
 
         data: Dict[str, Any] = {}
         cursor = 0
-        for full_key in self._state_keys:
+        for full_key in keys:
             dim_k = self._state_key_dims.get(full_key, 1)
             data[full_key] = arr[:, cursor : cursor + dim_k]
             cursor += dim_k
 
-        state_side = set(self._state_keys)
+        state_side = set(keys)
         for transform in self._transform.transforms:
             if not isinstance(transform, (StateActionToTensor, StateActionTransform)):
                 continue
@@ -505,7 +533,7 @@ class PolicyNormProcessor:
             data = transform(data)
 
         parts: List[np.ndarray] = []
-        for full_key in self._state_keys:
+        for full_key in keys:
             v = data[full_key]
             if isinstance(v, torch.Tensor):
                 v = v.detach().cpu().numpy()

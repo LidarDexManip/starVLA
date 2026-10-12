@@ -34,11 +34,21 @@ def main(args) -> None:
         use_bf16=args.use_bf16,
         unnorm_key=args.unnorm_key,
     )
+    focus = None
+    if args.focus_view != "off":
+        from deployment.model_server.focus_view import FocusViewSynth
+        focus = FocusViewSynth(sam=args.focus_view, device="cuda",
+                               camera=args.focus_camera or None, rate_hz=args.focus_rate_hz,
+                               tap_port=args.focus_tap_port)
     policy = Gr00tCompatPolicy(
         wrapper,
         unnorm_key=args.unnorm_key,
         send_state=not args.no_state,
         fallback_instruction=args.fallback_instruction,
+        focus_synth=focus,
+        focus_source=args.focus_source,
+        predict_kwargs=({"num_steps": args.num_inference_steps}
+                        if args.num_inference_steps else None),
     )
 
     contract = policy.get_modality_config()
@@ -82,6 +92,35 @@ def build_argparser():
     parser.add_argument(
         "--fallback_instruction", type=str, default="",
         help="Language instruction used when the observation carries none.",
+    )
+    parser.add_argument(
+        "--focus_view", default="off", choices=["off", "tiny", "small", "base_plus", "large"],
+        help="Make the checkpoint's `focus` view on the SERVER (focus_view.py): a causal "
+             "OWLv2 + SAM 2.1-<size> tracker cuts the phase target's 300 px window from the "
+             "full-size ego frame, so the client sends only the ego camera (five-step v6).",
+    )
+    parser.add_argument(
+        "--focus_camera", default="",
+        help="host:port of the EGO camera's binary ZMQ stream (the robot: 192.168.123.164:5555). "
+             "Set: a background thread tracks on it at --focus_rate_hz and yields to inference. "
+             "Empty: the tracker steps on the frames the requests carry (openloop).",
+    )
+    parser.add_argument("--focus_rate_hz", type=float, default=10.0)
+    parser.add_argument(
+        "--focus_tap_port", type=int, default=0,
+        help="PUB port for the operator feed: every request's served focus crop + the ego frame "
+             "with its window, as keyed JPEG tiles (the bridge frame tap's VIEWJPG1 wire; the "
+             "console shows them as policy-eye tiles). 0 = off.",
+    )
+    parser.add_argument(
+        "--focus_source", default="rgb",
+        help="The view the focus window is cut from (default rgb = the ego camera).",
+    )
+    parser.add_argument(
+        "--num_inference_steps", type=int, default=None,
+        help="Override the flow-matching denoise steps per call (PI0 / PI05; default: the "
+             "checkpoint's, 10). 5 halves the action-expert time; measured on the five-step "
+             "v5 PI0.5: 140 -> 108 ms on an RTX 4080, normalised action change 0.00006 vs 10.",
     )
     return parser
 

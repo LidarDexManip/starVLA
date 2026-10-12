@@ -29,6 +29,7 @@ train, and the wire contract follows.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,6 +38,14 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _GR00T_LANGUAGE_KEY = "annotation.human.task_description"
+
+#: State keys the SERVER makes from the focus window it served (five-step v6 run B): the window's
+#: top-left corner in ego pixels and the following flag -- the dataset's observation.focus.window[:2]
+#: and observation.focus.following, which the bridge does not have.
+_FOCUS_STATE = {
+    "state.focus_corner": lambda rec: [float(rec["window"][0]), float(rec["window"][1])],
+    "state.focus_following": lambda rec: [float(rec["following"])],
+}
 
 
 def _latest_frame(value: Any, dim: int, key: str) -> np.ndarray:
@@ -115,6 +124,13 @@ class Gr00tCompatPolicy:
         send_state: Include flattened proprioception in the example. Set False
             for checkpoints trained without state input.
         fallback_instruction: Used when the observation carries no language.
+        focus_synth: Optional ``focus_view.FocusViewSynth``. When the checkpoint
+            declares a ``focus`` view and the observation does not carry one,
+            the server MAKES it from ``focus_source`` (the full-size ego frame)
+            and the instruction, so a client sends only the ego camera.
+        focus_source: The view the focus window is cut from (default ``rgb``).
+        predict_kwargs: Extra keyword arguments for every
+            ``predict_action`` call (e.g. ``{"num_steps": 5}`` for PI0/PI05).
     """
 
     def __init__(
@@ -123,10 +139,16 @@ class Gr00tCompatPolicy:
         unnorm_key: Optional[str] = None,
         send_state: bool = True,
         fallback_instruction: str = "",
+        focus_synth=None,
+        focus_source: str = "rgb",
+        predict_kwargs: Optional[dict] = None,
     ) -> None:
         self._wrapper = wrapper
         self._send_state = send_state
         self._fallback_instruction = fallback_instruction
+        self._focus = focus_synth
+        self._focus_source = focus_source
+        self._predict_kwargs = dict(predict_kwargs or {})
 
         proc = wrapper.get_norm_processor(unnorm_key)
         self._proc = proc
@@ -142,15 +164,27 @@ class Gr00tCompatPolicy:
         self._action_key_dims: Dict[str, int] = dict(proc.action_key_dims)
         # Camera views in TRAINING order; see `_resolve_video_order`.
         self._video_keys: List[str] = list(getattr(proc, "video_keys", []))
+        # The state the MODEL was fed (yaml state_input_keys), when every key of it is one the
+        # server makes from its own focus window: then the server sends it whatever --no_state
+        # says, because the client has nothing to send.
+        input_keys = list(getattr(proc, "state_input_keys", []) or [])
+        self._focus_state_keys: List[str] = (
+            input_keys if input_keys and all(k in _FOCUS_STATE for k in input_keys) else [])
+        if self._focus_state_keys and focus_synth is None:
+            raise ValueError(
+                f"this checkpoint was fed the focus window as state {self._focus_state_keys}; "
+                "serve it with --focus_view (the server makes the window and the state)")
 
         logger.info(
             "Gr00tCompatPolicy ready: unnorm_key=%s video order=%s state order=%s "
-            "(history %d, q99-normalised on this side) action split=%s",
+            "(history %d, q99-normalised on this side) action split=%s%s",
             self._unnorm_key,
             [k.split(".", 1)[-1] for k in self._video_keys],
             [(k.split(".", 1)[-1], self._state_key_dims.get(k, 1)) for k in self._state_keys],
             self._state_history_length,
             [(k.split(".", 1)[-1], self._action_key_dims.get(k, 1)) for k in self._action_keys],
+            (f"; model state = SERVER-MADE focus window {self._focus_state_keys}"
+             if self._focus_state_keys else ""),
         )
 
     # -- GR00T PolicyServer endpoints -----------------------------------------
@@ -159,14 +193,25 @@ class Gr00tCompatPolicy:
         self, observation: Dict[str, Any], options: Optional[dict] = None
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
         example = self.obs_to_example(observation)
-        result = self._wrapper.predict_action(examples=[example], unnorm_key=self._unnorm_key)
+        # a background focus tracker (focus_view.py) waits while the model runs
+        lock = getattr(self._focus, "gpu_lock", None)
+        with (lock if lock is not None else contextlib.nullcontext()):
+            result = self._wrapper.predict_action(examples=[example], unnorm_key=self._unnorm_key,
+                                                  **self._predict_kwargs)
         actions = np.asarray(result["actions"])  # (B, T, D)
         action_dict = self.split_actions(actions)
         info = {"unnorm_key": self._unnorm_key, "action_dim": int(actions.shape[-1])}
+        if self._focus is not None and self._focus.served is not None:
+            rec = self._focus.served
+            info["focus"] = {k: rec[k] for k in ("target", "window", "following", "visibility",
+                                                  "locked", "acquired", "ms")}
         return action_dict, info
 
     def reset(self, options: Optional[dict] = None) -> Dict[str, Any]:
-        # starVLA inference is stateless per request; nothing to clear.
+        # starVLA inference is stateless per request; only the server-side
+        # focus tracker (if any) holds state: a reset re-acquires its target.
+        if self._focus is not None:
+            self._focus.reset()
         return {"ok": True}
 
     def get_modality_config(self) -> Dict[str, Any]:
@@ -217,7 +262,11 @@ class Gr00tCompatPolicy:
                 f"be silently misread. Received: {sorted(video)}"
             )
         extra = [k for k in video if k not in declared]
-        if extra:
+        if extra and tuple(extra) != getattr(self, "_extra_views_said", None):
+            # once per distinct set: a client that always sends one camera more
+            # than the checkpoint uses (the v6 focus lanes keep the v5 camera
+            # set) must not write a warning on every request
+            self._extra_views_said = tuple(extra)
             logger.warning(
                 "observation carries views %s that the checkpoint was not trained "
                 "on; ignoring them (trained views: %s)", extra, declared,
@@ -228,6 +277,18 @@ class Gr00tCompatPolicy:
         video = observation.get("video")
         if not isinstance(video, dict) or not video:
             raise KeyError("observation is missing the 'video' modality dict")
+        declared = [k.split(".", 1)[-1] for k in self._video_keys]
+        focus_rec = None
+        if self._focus is not None and "focus" in declared and "focus" not in video:
+            # Server-made focus view (focus_view.py): cut from the FULL-SIZE ego
+            # frame before any resize -- the training window is native pixels.
+            if self._focus_source not in video:
+                raise KeyError(f"focus view: the observation has no {self._focus_source!r} "
+                               f"view to cut it from (received {sorted(video)})")
+            ego = _latest_image(video[self._focus_source])
+            crop, focus_rec = self._focus(ego, _extract_language(observation, self._fallback_instruction))
+            video = dict(video)
+            video["focus"] = crop
         images = [_latest_image(video[k]) for k in self._resolve_video_order(video)]
         # Optional serve-time view hook, defined by the checkpoint's own
         # DataConfig (single source of the training-time view pipeline).
@@ -244,7 +305,17 @@ class Gr00tCompatPolicy:
             "lang": _extract_language(observation, self._fallback_instruction),
         }
 
-        if self._send_state and self._state_keys:
+        if self._focus_state_keys:
+            if focus_rec is None:
+                raise KeyError("this checkpoint takes the focus window as state, but no focus "
+                               "view was made for this request (the client sent its own?)")
+            raw = np.concatenate([_FOCUS_STATE[k](focus_rec) for k in self._focus_state_keys])
+            norm = self._proc.apply_state(raw[None, :].astype(np.float32), keys=self._focus_state_keys)
+            # float16 round trip: datasets.py packs the model's state as float16, and PI0.5
+            # bins it into 256 discrete tokens -- a float32 value on a bin edge could land
+            # one bin away from the training value
+            example["state"] = norm.astype(np.float16).astype(np.float32)
+        elif self._send_state and self._state_keys:
             state_in = observation.get("state")
             if not isinstance(state_in, dict):
                 raise KeyError(
