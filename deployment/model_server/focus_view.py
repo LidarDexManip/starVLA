@@ -303,6 +303,9 @@ class FocusViewSynth:
     def __init__(self, sam="small", device="cuda", exemplar_dir=None, camera: Optional[str] = None,
                  rate_hz: float = 10.0, detect_period_s: float = 0.5, tap_port: int = 0):
         import threading
+        from .focus_timing import FocusTiming
+        self.timing = FocusTiming()
+        self._last_record_at = None
         self.tracker = FocusTracker(sam=sam, device=device, exemplar_dir=exemplar_dir)
         self._tap = FocusTap(tap_port) if tap_port else None
         self._sentence, self._gen = None, 0
@@ -323,6 +326,7 @@ class FocusViewSynth:
     def reset(self):
         with self._state_lock:
             self._sentence, self.last = None, None
+            self._last_record_at = None
             self._gen += 1
 
     def _log_rec(self, rec):
@@ -348,16 +352,25 @@ class FocusViewSynth:
                     rec = None
                     if self.tracker.locked:
                         with self.gpu_lock:
-                            rec = self.tracker.step(frame)
+                            token = self.timing.begin("tracking", target_for(sentence), gen)
+                            try:
+                                rec = self.tracker.step(frame)
+                            finally:
+                                self.timing.end(token)
                     elif t0 - last_detect >= self._detect_period:
                         last_detect = t0
-                        rec = self.tracker.step(frame)
+                        token = self.timing.begin("detection", target_for(sentence), gen)
+                        try:
+                            rec = self.tracker.step(frame)
+                        finally:
+                            self.timing.end(token)
                     if rec is not None:
                         self._log_rec(rec)
                         self.n_bg += 1
                         with self._state_lock:
                             if gen == self._gen:
                                 self.last = rec
+                                self._last_record_at = time.perf_counter()
             except Exception as e:                     # a tracker hiccup must not end the thread
                 logger.warning("focus view: background step failed: %s: %s", type(e).__name__, e)
             time.sleep(max(0.0, self._period - (time.monotonic() - t0)))
@@ -391,9 +404,14 @@ class FocusViewSynth:
             with self._state_lock:
                 if sentence != self._sentence:
                     self._sentence, self.last = sentence, None
+                    self._last_record_at = None
                     self._gen += 1
                     logger.info("focus view: target %s for %r", target, sentence[:60])
                 rec = self.last if self.last is not None else self._prior_rec(ego_rgb.shape, target)
+                rec = dict(rec, generation=self._gen,
+                           record_age_ms=None if self._last_record_at is None else
+                               (time.perf_counter()-self._last_record_at)*1000,
+                           using_prior=self.last is None)
         self.served = rec
         crop = self.tracker.crop(ego_rgb, rec)
         if self._tap is not None:
