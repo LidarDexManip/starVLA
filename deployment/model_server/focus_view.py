@@ -135,15 +135,24 @@ class FocusTracker:
         self.target = target
         self.sess, self.locked, self.last, self.c, self.t_prev = None, False, None, None, None
         self.areas = []
+        self._sam_frame_idx = 0
+        self.sam_cache = None
 
     @torch.no_grad()
     def _sam(self, rgb, box=None):
         inputs = self.sam_p(images=rgb, device=self.dev, return_tensors="pt")
         if box is not None:
             self.sess = self.sam_p.init_video_session(inference_device=self.dev, dtype=torch.bfloat16)
+            self._sam_frame_idx = 0
             self.sam_p.add_inputs_to_inference_session(inference_session=self.sess, frame_idx=0, obj_ids=1,
                                                        input_boxes=[[box]], original_size=inputs.original_sizes[0])
-        out = self.sam(inference_session=self.sess, frame=inputs.pixel_values[0].to(torch.bfloat16))
+        out = self.sam(inference_session=self.sess, frame_idx=self._sam_frame_idx,
+                       frame=inputs.pixel_values[0].to(torch.bfloat16))
+        from .focus_history import prune_streaming_history
+        self.sam_cache = prune_streaming_history(
+            self.sess, self._sam_frame_idx, num_maskmem=self.sam.num_maskmem,
+            max_object_pointers=self.sam.config.max_object_pointers_in_encoder)
+        self._sam_frame_idx += 1
         m = self.sam_p.post_process_masks([out.pred_masks], original_sizes=inputs.original_sizes,
                                           binarize=True)[0][0, 0].cpu().numpy()
         ys, xs = np.nonzero(m)
@@ -185,7 +194,7 @@ class FocusTracker:
         y0 = float(np.clip(np.round(self.c[1] - SIDE / 2), 0, H - SIDE))
         return {"target": self.target, "window": [x0, y0, x0 + SIDE, y0 + SIDE], "center": self.c.tolist(),
                 "following": fol, "visibility": float(vis), "locked": self.locked, "acquired": acquired,
-                "box": b, "ms": 1000 * (time.perf_counter() - t0)}
+                "box": b, "sam_cache": self.sam_cache, "ms": 1000 * (time.perf_counter() - t0)}
 
     @staticmethod
     def crop(rgb, rec):
