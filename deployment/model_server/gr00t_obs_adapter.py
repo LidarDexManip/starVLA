@@ -168,6 +168,10 @@ class Gr00tCompatPolicy:
         # server makes from its own focus window: then the server sends it whatever --no_state
         # says, because the client has nothing to send.
         input_keys = list(getattr(proc, "state_input_keys", []) or [])
+        self._model_state_keys = input_keys or self._state_keys
+        unknown = set(input_keys) - set(self._state_keys)
+        if unknown:
+            raise ValueError(f"Unknown checkpoint model state keys: {sorted(unknown)}")
         self._focus_state_keys: List[str] = (
             input_keys if input_keys and all(k in _FOCUS_STATE for k in input_keys) else [])
         if self._focus_state_keys and focus_synth is None:
@@ -323,7 +327,7 @@ class Gr00tCompatPolicy:
                     f"checkpoint was trained with state keys {self._state_keys}"
                 )
             pieces = []
-            for full_key in self._state_keys:
+            for full_key in self._model_state_keys:
                 subkey = full_key.split(".", 1)[-1]
                 if subkey not in state_in:
                     raise KeyError(
@@ -340,7 +344,12 @@ class Gr00tCompatPolicy:
             # NORMALISE. The head was trained on q99-normalised state; sending
             # raw radians here is the bug that made --no_state the only safe
             # option on the pipette lane.
-            example["state"] = self._proc.apply_state(raw)
+            if self._model_state_keys != self._state_keys:
+                norm = self._proc.apply_state(raw, keys=self._model_state_keys)
+                # PI05 training packs selected state as float16 before tokenization.
+                example["state"] = norm.astype(np.float16).astype(np.float32)
+            else:
+                example["state"] = self._proc.apply_state(raw)
         return example
 
     def split_actions(self, actions: np.ndarray) -> Dict[str, np.ndarray]:

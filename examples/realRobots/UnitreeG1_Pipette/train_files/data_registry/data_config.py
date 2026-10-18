@@ -1883,6 +1883,17 @@ class Pipette2ViewPI05EgoFocusSq224Wrist12RelLThumbRelJoint14DataConfig(
     SQUARE_VIEWS = ()
 
 
+class Pipette2ViewPI05EgoFocusVelSq224Wrist12RelLThumbRelJoint14DataConfig(Pipette2ViewPI05EgoFocusSq224Wrist12RelLThumbRelJoint14DataConfig):
+    """v6 run D: ego + focus, with ONLY measured wrist velocity as model state.
+
+    The other 59 dims remain available for relative-label anchors. The checkpoint
+    config.full.yaml selects state.wrist_vel; q99 statistics append its six dims.
+    """
+
+    state_keys = Pipette2ViewPI05EgoFocusSq224Wrist12RelLThumbRelJoint14DataConfig.state_keys + ["state.wrist_vel"]
+    state_key_dims = {**Pipette2ViewPI05EgoFocusSq224Wrist12RelLThumbRelJoint14DataConfig.state_key_dims, "state.wrist_vel": 6}
+
+
 class Pipette2ViewPI05EgoFocusXYSq224Wrist12RelLThumbRelJoint14DataConfig(
         Pipette2ViewPI05EgoFocusSq224Wrist12RelLThumbRelJoint14DataConfig):
     """Five-step v6 run B (2026-10-09): run A (ego + focus views, v5's labels) PLUS the
@@ -1922,6 +1933,7 @@ class Pipette3ViewPI05EgoWristFocusSq224Wrist12RelLThumbRelJoint14DataConfig(
 
 
 ROBOT_TYPE_CONFIG_MAP = {
+    "unitree_g1_pipette_egofocusvel_pi05sq224_wrist12rel_lthumbrel_joint14": Pipette2ViewPI05EgoFocusVelSq224Wrist12RelLThumbRelJoint14DataConfig(),
     "unitree_g1_pipette_n1d7": PipetteTipG1GR00TN1d7DataConfig(),
     "unitree_g1_pipette_armhand_n1d7": PipetteTipG1ArmHandOnlyDataConfig(),
     # Same task/action space, plus the detector-tracked tip crop (2 views).
@@ -2778,6 +2790,14 @@ DATASET_NAMED_MIXTURES = {
          "unitree_g1_pipette_2view_pi05sq224_wrist12rel_lthumbrel_joint14"),
     ],
     # Five-step v6 (2026-10-09): ego + FOCUS (dataset v1.2 + focus), v4's split.
+    "unitree_g1_pipette_egofocusvel_5task447v12_pi05sq224_train_mix": [
+        ("g1-pipette-egofocusvel-5task447v12-pi05sq224-train", 1.0,
+         "unitree_g1_pipette_egofocusvel_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocusvel_5task447v12_pi05sq224_eval_mix": [
+        ("g1-pipette-egofocusvel-5task447v12-pi05sq224-eval", 1.0,
+         "unitree_g1_pipette_egofocusvel_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
     "unitree_g1_pipette_egofocus_5task447v12_pi05sq224_train_mix": [
         ("g1-pipette-egofocus-5task447v12-pi05sq224-train", 1.0,
          "unitree_g1_pipette_egofocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
