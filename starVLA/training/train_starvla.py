@@ -539,7 +539,14 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
+            # Evaluate / save once per optimizer step. Under gradient accumulation
+            # completed_steps holds for `accum` micro-batches, and checking every
+            # micro-batch re-ran each holdout eval (and re-wrote each checkpoint)
+            # that many times. Step 0 still evaluates once: the starting weights.
+            new_step = self.completed_steps != getattr(self, "_checked_step", None)
+            self._checked_step = self.completed_steps
+
+            if new_step and self.completed_steps % self.config.trainer.eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
                 step_metrics = self.eval_holdout(step_metrics)
 
@@ -547,7 +554,7 @@ class VLATrainer(TrainerUtils):
             step_metrics["timing/model"] = t_end_model - t_start_model
             self._log_metrics(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+            if new_step and self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
                 self._save_checkpoint()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
