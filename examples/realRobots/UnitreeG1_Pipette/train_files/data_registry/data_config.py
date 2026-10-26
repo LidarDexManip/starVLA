@@ -2798,6 +2798,16 @@ DATASET_NAMED_MIXTURES = {
         ("g1-pipette-egofocusvel-5task447v12-pi05sq224-eval", 1.0,
          "unitree_g1_pipette_egofocusvel_pi05sq224_wrist12rel_lthumbrel_joint14"),
     ],
+    # Pipette aim R3 (2026-10-25): run E's dirs restricted to the step-3 episodes,
+    # run E's statistics byte-copied (jren313/starvla-pipette-aim-r3-qwenoft-egofocusvel).
+    "unitree_g1_pipette_egofocusvel_p3_447v12_pi05sq224_train_mix": [
+        ("g1-pipette-egofocusvel-p3-447v12-pi05sq224-train", 1.0,
+         "unitree_g1_pipette_egofocusvel_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocusvel_p3_447v12_pi05sq224_eval_mix": [
+        ("g1-pipette-egofocusvel-p3-447v12-pi05sq224-eval", 1.0,
+         "unitree_g1_pipette_egofocusvel_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
     "unitree_g1_pipette_egofocus_5task447v12_pi05sq224_train_mix": [
         ("g1-pipette-egofocus-5task447v12-pi05sq224-train", 1.0,
          "unitree_g1_pipette_egofocus_pi05sq224_wrist12rel_lthumbrel_joint14"),
