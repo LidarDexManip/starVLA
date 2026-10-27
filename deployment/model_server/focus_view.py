@@ -41,6 +41,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 SIDE, OUT = 300, 224
+TAP_IDLE_S = 1.0    # no request for this long (paused, reset, before PLAY): the tap shows the tracker's preview
 KEEP = {"holder": 0.9, "rack": 0.9, "tube": 0.3}
 EMA20 = {"holder": 0.3, "rack": 0.3, "tube": 0.5}
 #: phase sentence prefix -> target (the five-step plan's sentences; build_focus_v13.py's PH table)
@@ -268,7 +269,8 @@ class FocusTap:
             cv2.rectangle(img, (b[0], b[1]), (b[2], b[3]), (0, 200, 255), 1)
         w = [round(v * s) for v in rec["window"]]
         cv2.rectangle(img, (w[0], w[1]), (w[2] - 1, w[3] - 1), cls.COLOURS[state], 2)
-        label = f"{rec['target']}  {state}  vis {rec['visibility']:.2f}"
+        label = (f"{rec['target']}  {state}{'  PREVIEW (no inference)' if rec.get('preview') else ''}"
+                 f"  vis {rec['visibility']:.2f}")
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         cv2.rectangle(img, (0, 0), (tw + 10, th + 10), (0, 0, 0), -1)
         cv2.putText(img, label, (5, th + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, cls.COLOURS[state], 1,
@@ -317,6 +319,7 @@ class FocusViewSynth:
         self._last_record_at = None
         self.tracker = FocusTracker(sam=sam, device=device, exemplar_dir=exemplar_dir)
         self._tap = FocusTap(tap_port) if tap_port else None
+        self._tap_offered, self._tap_sentence = 0.0, None   # the last request's tap offer / sentence
         self._sentence, self._gen = None, 0
         self.last = None          # newest tracker record for the current sentence
         self.served = None        # the record the last REQUEST cropped with (response info)
@@ -380,9 +383,26 @@ class FocusViewSynth:
                             if gen == self._gen:
                                 self.last = rec
                                 self._last_record_at = time.perf_counter()
+                if frame is not None and self._tap is not None:
+                    self._tap_preview(frame)
             except Exception as e:                     # a tracker hiccup must not end the thread
                 logger.warning("focus view: background step failed: %s: %s", type(e).__name__, e)
             time.sleep(max(0.0, self._period - (time.monotonic() - t0)))
+
+    def _tap_preview(self, frame):
+        """Camera mode, no request for TAP_IDLE_S: the tap shows the tracker's own frame and what a
+        request would crop from it now (the newest record, else the prior), marked ``preview``. CPU
+        only (crop + JPEG on the tap thread); after reset() it does NOT restart tracking, it shows the
+        last request's target at its prior. Requests take the tiles back as soon as inference runs."""
+        if time.monotonic() - self._tap_offered < TAP_IDLE_S:
+            return
+        with self._state_lock:
+            sentence, last = self._sentence or self._tap_sentence, self.last
+        target = target_for(sentence) if sentence else None
+        if target is None:
+            return
+        rec = dict(last if last is not None else self._prior_rec(frame.shape, target), preview=True)
+        self._tap.offer(frame, self.tracker.crop(frame, rec), rec)
 
     def _prior_rec(self, shape, target):
         """The window before anything is tracked for this phase: the target's training prior."""
@@ -424,5 +444,6 @@ class FocusViewSynth:
         self.served = rec
         crop = self.tracker.crop(ego_rgb, rec)
         if self._tap is not None:
+            self._tap_offered, self._tap_sentence = time.monotonic(), sentence
             self._tap.offer(ego_rgb, crop, rec)
         return crop, rec
