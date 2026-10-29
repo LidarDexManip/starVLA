@@ -415,7 +415,24 @@ class PI0(baseframework):
             start = end
         return next_streams
 
-    def forward_from_observation(self, observation: Observation, actions: torch.Tensor, noise=None, time=None, return_debug=False):
+    def _loss_weights(self, examples: list[dict]) -> torch.Tensor | None:
+        '''
+        Sirius/IWR per-timestep weights [B, action_horizon] from the loader's ``loss_weight``
+        (datasets.py ``loss_weight_key``), aligned with the labels _prepare_examples pads at the
+        end. None when no sample carries them; a sample without the key counts 1.0, as in QwenOFT.
+        '''
+        rows = [example.get("loss_weight") for example in examples]
+        if all(lw is None for lw in rows):
+            return None
+        out = np.ones((len(rows), self.action_horizon), dtype=np.float32)
+        for i, lw in enumerate(rows):
+            if lw is not None:
+                lw = np.asarray(lw, dtype=np.float32).reshape(-1)[: self.action_horizon]
+                out[i, : lw.shape[0]] = lw
+        return torch.from_numpy(out)
+
+    def forward_from_observation(self, observation: Observation, actions: torch.Tensor, noise=None, time=None, return_debug=False,
+                                 loss_weight: torch.Tensor | None = None):
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         x_t, u_t, noise, time = self.action_head.prepare_flow_targets(actions, noise=noise, time=time)
@@ -435,7 +452,14 @@ class PI0(baseframework):
             adarms_cond=adarms_cond,
         )
         v_t = self.action_head.decode_action_velocity(suffix_out)
-        out = {"v_t": v_t, "action_loss": F.mse_loss(u_t, v_t, reduction="none").mean()}
+        step_loss = F.mse_loss(u_t, v_t, reduction="none").mean(dim=-1)  # [B, H]
+        if loss_weight is None:
+            action_loss = step_loss.mean()
+        else:
+            # weighted mean: same scale as the unweighted loss; 0 masks a timestep, >1 upweights it
+            w = loss_weight.to(device=step_loss.device, dtype=step_loss.dtype)
+            action_loss = (step_loss * w).sum() / w.sum().clamp_min(1e-6)
+        out = {"v_t": v_t, "action_loss": action_loss}
         if return_debug:
             out.update({"u_t": u_t, "x_t": x_t, "time": time, "noise": noise})
         return out
@@ -453,6 +477,7 @@ class PI0(baseframework):
             noise=kwargs.get("noise"),
             time=kwargs.get("time"),
             return_debug=bool(kwargs.get("return_debug", False)),
+            loss_weight=self._loss_weights(examples),
         )
 
     @torch.inference_mode()
