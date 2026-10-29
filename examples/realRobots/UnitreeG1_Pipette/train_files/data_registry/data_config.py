@@ -1932,8 +1932,39 @@ class Pipette3ViewPI05EgoWristFocusSq224Wrist12RelLThumbRelJoint14DataConfig(
     SQUARE_VIEWS = ("video.wrist_left",)
 
 
+class Pipette3ViewPI05EgoFocusWristVelSq224Wrist12RelLThumbRelJoint14DataConfig(
+        Pipette2ViewPI05EgoFocusVelSq224Wrist12RelLThumbRelJoint14DataConfig):
+    """Pipette aim R3 + wrist (2026-10-28): the egofocusvel config with the right-hand (pipette)
+    wrist camera as a THIRD view, appended after ego and focus so the first two keep their
+    places for the aim R3 QwenOFT start (user: "add the wrist view as the third input").
+
+    `video.wrist_left` is the recorder port-5556 fisheye (mounted on the right hand despite
+    the name), stored by server_data_record_d435.py --wrist_left_crop as the 600 x 600 box
+    WRIST_CROP of its 1920x1080 frame. 236 -> crop 224 like the other two views. Serving
+    takes the same box itself from a full-size frame (serve_view_preprocess)."""
+
+    video_keys = ["video.rgb", "video.focus", "video.wrist_left"]
+    PRE_HW = {"video.rgb": (236, 236), "video.focus": (236, 236), "video.wrist_left": (236, 236)}
+    VIEW_HW = {"video.rgb": (224, 224), "video.focus": (224, 224), "video.wrist_left": (224, 224)}
+    SQUARE_VIEWS = ()
+    WRIST_CROP = {"video.wrist_left": ((600, 240, 1200, 840), (1920, 1080))}   # (x0, y0, x1, y1), of (w, h)
+
+    def serve_view_preprocess(self, images):
+        images = list(images)
+        for i, key in enumerate(self.video_keys):
+            if key in self.WRIST_CROP and i < len(images):
+                (x0, y0, x1, y1), (w, h) = self.WRIST_CROP[key]
+                a = np.asarray(images[i])
+                if a.shape[:2] != (y1 - y0, x1 - x0):           # a full frame (any size): scale the box
+                    sy, sx = a.shape[0] / h, a.shape[1] / w
+                    a = a[round(y0 * sy):round(y1 * sy), round(x0 * sx):round(x1 * sx)]
+                images[i] = a
+        return super().serve_view_preprocess(images)
+
+
 ROBOT_TYPE_CONFIG_MAP = {
     "unitree_g1_pipette_egofocusvel_pi05sq224_wrist12rel_lthumbrel_joint14": Pipette2ViewPI05EgoFocusVelSq224Wrist12RelLThumbRelJoint14DataConfig(),
+    "unitree_g1_pipette_egofocuswristvel_pi05sq224_wrist12rel_lthumbrel_joint14": Pipette3ViewPI05EgoFocusWristVelSq224Wrist12RelLThumbRelJoint14DataConfig(),
     "unitree_g1_pipette_n1d7": PipetteTipG1GR00TN1d7DataConfig(),
     "unitree_g1_pipette_armhand_n1d7": PipetteTipG1ArmHandOnlyDataConfig(),
     # Same task/action space, plus the detector-tracked tip crop (2 views).
@@ -2820,6 +2851,16 @@ DATASET_NAMED_MIXTURES = {
     "unitree_g1_pipette_aim_r4_hgd_pi05sq224_eval_mix": [
         ("g1-pipette-egofocusvel-hgdaimr3-pi05sq224-eval", 1.0,
          "unitree_g1_pipette_egofocusvel_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    # Pipette aim R3 + wrist (2026-10-28): only the AC-lane HG-DAgger episodes recorded with the wrist
+    # crop (build_hil_dataset.py --wrist --insert-only --no-teleop), each cut before its pull-out.
+    "unitree_g1_pipette_egofocuswristvel_p3_insertnew_1028_train_mix": [
+        ("g1-pipette-egofocuswristvel-p3-insertnew-1028-pi05sq224-train", 1.0,
+         "unitree_g1_pipette_egofocuswristvel_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocuswristvel_p3_insertnew_1028_eval_mix": [
+        ("g1-pipette-egofocuswristvel-p3-insertnew-1028-pi05sq224-eval", 1.0,
+         "unitree_g1_pipette_egofocuswristvel_pi05sq224_wrist12rel_lthumbrel_joint14"),
     ],
     "unitree_g1_pipette_egofocus_5task447v12_pi05sq224_train_mix": [
         ("g1-pipette-egofocus-5task447v12-pi05sq224-train", 1.0,
