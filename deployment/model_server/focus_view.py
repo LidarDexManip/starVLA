@@ -4,7 +4,11 @@ The training focus view (dataset v1.2 + focus, ``observation.images.focus``) is 
 the 1280 x 720 ego frame around the phase's target, resized to 224 x 224:
 
     phase 1 / 5  pipette holder        OWLv2 image-guided (two exemplar crops)
-    phase 2 / 4  blue tube rack        HSV blue blob + the OWLv2 text box that agrees with it
+    phase 2 / 4  tube rack             OWLv2 text "a white board with blue holes", only boxes holding >= 3 of the rack's
+                                       round blue holes (11-17: a blue pixel share let the gripper's blue through)
+                                       (2026-11-16 new desk: white rack, blue holes; was the largest HSV blue blob + the
+                                       "blue" text box, which locked onto the blue centrifuge lid; the white-rack text
+                                       alone ranks the yellow tip box first)
     phase 3      tube opening          OWLv2 text "the opening of a plastic tube"
 
 tracked with SAM 2.1; the window FOLLOWS the target while it is clearly visible and HOLDS the last
@@ -26,9 +30,22 @@ the v6 notes); its "following" flag agrees less (the visibility reference differ
 
 ``FocusViewSynth`` is what the server calls: (ego frame, phase sentence) -> (224 crop, record). The
 sentence picks the target; a new sentence (a phase switch) or ``reset()`` re-acquires.
+
+Tube guards (2026-11-12). The best-scoring "opening of a plastic tube" box was sometimes NOT the tube in
+the left hand: the pipette's blue plunger (right hand raised), the orange-labelled block on the right, the
+left wrist; with no re-detection SAM then tracked it for the whole episode (pipette-like locks: 2/8
+autonomous successes vs 68 % for tube locks over 473 robot episodes). Colour cannot tell them apart (the
+block is orange, the real opening reads 0-4 % orange under bright light), position can:
+  * acquire only inside TUBE_ACQUIRE (box-centre bounds; first locks of autonomous successes: x p1-p99
+    289-584, y 378-612; the wrong locks sat at x > 650 or y < 340 or y ~ 690);
+  * a tracked box whose centre leaves the wider TUBE_KEEP (successes' tracked boxes: x p0.5-p99.5
+    364-712) drops the lock and the window returns to the prior while it re-detects;
+  * while locked, every recheck period the detector runs again (``recheck``): when its in-region boxes
+    all miss the tracked box and one of them sits elsewhere, twice in a row, SAM is re-prompted there.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -51,10 +68,24 @@ TARGET_BY_PREFIX = (("Pick up the pipette", "holder"), ("Pick up the tube", "rac
 #: (median of observation.focus.center at frame 0, which the builder back-filled with the target's
 #: real position; 379 train episodes, both capture venues pooled; p10-p90 spread about +-60 px).
 #: The frame centre instead was 290 px off on held-out holder episode 11.
-PRIOR_CENTRE = {"holder": (878.0, 602.0), "rack": (384.0, 578.0), "tube": (438.0, 460.0)}
+# rack (2026-11-17, new desk): the median FOLLOWING centre over 9 correctly locked P4 episodes (44-55, 3204 frames,
+# p10-p90 x 243-312, y 561-583); the old-desk training mean was (384, 578), ~130 px right of the new rack, so the
+# window sat on the rack's right half until the lock and then jumped.
+PRIOR_CENTRE = {"holder": (878.0, 602.0), "rack": (264.0, 574.0), "tube": (438.0, 460.0)}
 SAM_IDS = {"tiny": "facebook/sam2.1-hiera-tiny", "small": "facebook/sam2.1-hiera-small",
            "base_plus": "facebook/sam2.1-hiera-base-plus", "large": "facebook/sam2.1-hiera-large"}
 EXEMPLAR_DIR = Path(__file__).parent / "focus_exemplars"
+#: tube box-centre bounds (x0, y0, x1, y1) on the 1280 x 720 ego frame: where a lock may start / may stay
+TUBE_ACQUIRE = (250.0, 330.0, 700.0, 640.0)
+TUBE_KEEP = (200.0, 200.0, 780.0, 680.0)
+TUBE_TEXT = "the opening of a plastic tube"
+RECHECK_AGREE = 0.1     # a detection with IoU above this with the tracked box supports the track
+RECHECK_MOVES = 2       # consecutive unsupported rechecks with a box elsewhere before re-prompting
+
+
+def centre_in(b, region):
+    cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    return region[0] <= cx <= region[2] and region[1] <= cy <= region[3]
 
 
 def target_for(sentence: str) -> Optional[str]:
@@ -62,8 +93,37 @@ def target_for(sentence: str) -> Optional[str]:
     return next((t for p, t in TARGET_BY_PREFIX if s.startswith(p)), None)
 
 
+# operator 2026-11-17 (was "a white test tube rack", 11-16): on 28 new-desk frames the old text ranked the yellow tip
+# box first on all 28; this one ranks the rack first on 23 and, with the hole gate, finds it on 21 (15 before)
+RACK_TEXT = "a white board with blue holes"
+# A rack box must hold RACK_MIN_HOLES of the rack's round blue holes (2026-11-17). The blue PIXEL share (>= 3 %,
+# 11-16) was not enough: a box over the yellow tip box reached 3.1 % from the right gripper's blue parts and SAM
+# then slid onto the centrifuge (episodes 51 / 56). New-desk holes on the ego frame: 1400-1730 px, fill 0.57-0.69,
+# aspect ~1; the gripper / centrifuge-lid blobs fill 0.21-0.43.
+RACK_HOLE_AREA = (300, 6000)     # px on the 1280x720 ego frame
+RACK_HOLE_FILL = 0.5             # blob area / its bounding box (a disc 0.79)
+RACK_HOLE_ASPECT = (0.6, 1.6)    # bounding-box width / height
+RACK_MIN_HOLES = 3
+
+
+def blue_mask(rgb):
+    return cv2.inRange(cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV), (100, 150, 90), (125, 255, 255))
+
+
+def rack_holes(rgb):
+    """Centres (N, 2) of the blue blobs shaped like the rack's holes: round-ish and of hole size."""
+    n, _, st, cen = cv2.connectedComponentsWithStats((blue_mask(rgb) > 0).astype(np.uint8), 8)
+    keep = []
+    for i in range(1, n):
+        x, y, w, h, a = st[i]
+        if (RACK_HOLE_AREA[0] <= a <= RACK_HOLE_AREA[1] and a / float(w * h) >= RACK_HOLE_FILL
+                and RACK_HOLE_ASPECT[0] <= w / float(h) <= RACK_HOLE_ASPECT[1]):
+            keep.append(cen[i])
+    return np.asarray(keep, float).reshape(-1, 2)
+
+
 def hsv_blue(rgb, area=False):
-    m = cv2.inRange(cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV), (100, 150, 90), (125, 255, 255))
+    m = blue_mask(rgb)
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     n, _, st, _ = cv2.connectedComponentsWithStats(m)
     if n < 2:
@@ -119,16 +179,46 @@ class FocusTracker:
         clip = lambda b: [max(0.0, b[0]), max(0.0, b[1]), min(W - 1.0, b[2]), min(H - 1.0, b[3])]
         area = lambda b: (b[2] - b[0]) * (b[3] - b[1])
         if self.target == "rack":
-            hb = hsv_blue(rgb)
-            if hb is None or area(hb) < 0.005 * A:
-                return None
-            best = max(self._owl_text(rgb, "a blue test tube rack"), key=lambda c: iou(c[0], hb), default=None)
-            return clip(best[0] if best is not None and iou(best[0], hb) > 0.3 else hb)
+            holes = rack_holes(rgb)
+
+            def n_holes(b):
+                return int(np.sum((holes[:, 0] >= b[0]) & (holes[:, 0] <= b[2])
+                                  & (holes[:, 1] >= b[1]) & (holes[:, 1] <= b[3])))
+            dets = [(b, s) for b, s in self._owl_text(rgb, RACK_TEXT)
+                    if 0.005 * A < area(b) < 0.3 * A and n_holes(b) >= RACK_MIN_HOLES]
+            return clip(max(dets, key=lambda c: c[1])[0]) if dets else None
         if self.target == "holder":
             dets = [b for b in (self._owl_image(rgb, e) for e in self.exemplars) if b and 0.002 * A < area(b) < 0.04 * A]
             return clip(np.median(np.array(dets), axis=0).tolist()) if dets else None
-        c = [(b, s) for b, s in self._owl_text(rgb, "the opening of a plastic tube") if 0.001 * A < area(b) < 0.02 * A]
+        c = self._tube_candidates(rgb)
         return clip(max(c, key=lambda x: x[1])[0]) if c else None
+
+    def _tube_candidates(self, rgb):
+        """The tube detector's boxes of a plausible size whose centre is inside TUBE_ACQUIRE."""
+        H, W = rgb.shape[:2]; A = H * W
+        area = lambda b: (b[2] - b[0]) * (b[3] - b[1])
+        return [(b, s) for b, s in self._owl_text(rgb, TUBE_TEXT)
+                if 0.001 * A < area(b) < 0.02 * A and centre_in(b, TUBE_ACQUIRE)]
+
+    def recheck(self, rgb):
+        """Locked on the tube: run the detector again. Returns the box to re-prompt SAM with, or None.
+        Re-prompts only when, RECHECK_MOVES times in a row, no in-region detection overlaps the tracked
+        box and one exists elsewhere (no detection at all, e.g. the pipette tip covering the opening,
+        keeps the track and resets the count)."""
+        if self.target != "tube" or not self.locked:
+            return None
+        cand = self._tube_candidates(rgb)
+        cur = self.box_now
+        if not cand or (cur is not None and any(iou(b, cur) > RECHECK_AGREE for b, _ in cand)):
+            self.moves = 0
+            return None
+        self.moves += 1
+        if self.moves < RECHECK_MOVES:
+            return None
+        self.moves = 0
+        H, W = rgb.shape[:2]
+        b = max(cand, key=lambda x: x[1])[0]
+        return [max(0.0, b[0]), max(0.0, b[1]), min(W - 1.0, b[2]), min(H - 1.0, b[3])]
 
     # -- tracking ---------------------------------------------------------------------------
     def reset(self, target):
@@ -138,6 +228,7 @@ class FocusTracker:
         self.areas = []
         self._sam_frame_idx = 0
         self.sam_cache = None
+        self.box_now, self.moves = None, 0     # the newest tracked box; recheck's disagreement count
 
     @torch.no_grad()
     def _sam(self, rgb, box=None):
@@ -162,19 +253,29 @@ class FocusTracker:
     def _centre(self, b):
         return ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2 if self.target != "tube" else b[1] + 0.25 * (b[3] - b[1]))
 
-    def step(self, rgb, t=None):
-        """One frame (RGB, ego size). ``t`` (s) times the EMA; default: the wall clock."""
+    def step(self, rgb, t=None, reprompt=None):
+        """One frame (RGB, ego size). ``t`` (s) times the EMA; default: the wall clock. ``reprompt``: a
+        box from ``recheck`` on this frame -- SAM restarts there (visibility reference included)."""
         t0 = time.perf_counter()
         t = time.monotonic() if t is None else float(t)
         H, W = rgb.shape[:2]
-        acquired, b = False, None
-        if not self.locked:
+        acquired, reacquired, dropped, b = False, False, False, None
+        if reprompt is not None and self.locked:
+            b = self._sam(rgb, box=reprompt)
+            self.areas, self.last, reacquired = [], self._centre(reprompt), True
+        elif not self.locked:
             box = self.detect(rgb)
             if box is not None:
                 b = self._sam(rgb, box=box)
                 self.locked, acquired, self.last = True, True, self._centre(box)
         else:
             b = self._sam(rgb)
+        if b is not None and self.target == "tube" and not centre_in(b, TUBE_KEEP):
+            # the track walked off where the tube can be (onto the pipette, the block, a wrist): drop it,
+            # the window heads back to the prior and the next steps detect again
+            self.sess, self.locked, self.last, self.areas, self.moves = None, False, None, [], 0
+            b, dropped = None, True
+        self.box_now = b
         vis, fol = 0.0, 0
         if b is not None:
             # causal twin of the builder's episode-p95 reference: p95 of the areas seen so far
@@ -195,6 +296,7 @@ class FocusTracker:
         y0 = float(np.clip(np.round(self.c[1] - SIDE / 2), 0, H - SIDE))
         return {"target": self.target, "window": [x0, y0, x0 + SIDE, y0 + SIDE], "center": self.c.tolist(),
                 "following": fol, "visibility": float(vis), "locked": self.locked, "acquired": acquired,
+                "reacquired": reacquired, "dropped": dropped,
                 "box": b, "sam_cache": self.sam_cache, "ms": 1000 * (time.perf_counter() - t0)}
 
     @staticmethod
@@ -256,6 +358,17 @@ class FocusTap:
             self._job = (ego_rgb, crop, rec)
             self._cv.notify()
 
+    @staticmethod
+    def record(rec):
+        """the JSON-safe part of a window record, stamped with the wall clock (ms)"""
+        box = rec.get("box")
+        return {"t_ms": int(time.time() * 1000), "target": rec.get("target"),
+                "window": [float(v) for v in rec["window"]], "center": [float(v) for v in rec["center"]],
+                "following": bool(rec.get("following")), "locked": bool(rec.get("locked")),
+                "visibility": float(rec.get("visibility", 0.0)), "preview": bool(rec.get("preview", False)),
+                "reacquired": bool(rec.get("reacquired")), "dropped": bool(rec.get("dropped")),
+                "box": None if box is None else [float(v) for v in box[:4]]}
+
     @classmethod
     def window_view(cls, ego_rgb, rec):
         """The ego frame at WIDTH with the served window (green following / amber holding the last
@@ -284,6 +397,9 @@ class FocusTap:
                     self._cv.wait()
                 (ego, crop, rec), self._job = self._job, None
             try:
+                # the window record first (2026-11-06): the episode recorder stores it per frame, so datasets
+                # crop the FOCUS view exactly as served instead of re-tracking offline (VIEWJSN1:focus:<json>)
+                self.sock.send(b"VIEWJSN1:focus:" + json.dumps(self.record(rec)).encode(), self._zmq.NOBLOCK)
                 for name, img in (("focus", crop), ("focus_window", self.window_view(ego, rec))):
                     ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
                                            [int(cv2.IMWRITE_JPEG_QUALITY), 85])
@@ -312,7 +428,8 @@ class FocusViewSynth:
     """
 
     def __init__(self, sam="small", device="cuda", exemplar_dir=None, camera: Optional[str] = None,
-                 rate_hz: float = 10.0, detect_period_s: float = 0.5, tap_port: int = 0):
+                 rate_hz: float = 10.0, detect_period_s: float = 0.5, tap_port: int = 0,
+                 recheck_period_s: float = 1.0):
         import threading
         from .focus_timing import FocusTiming
         self.timing = FocusTiming()
@@ -327,6 +444,9 @@ class FocusViewSynth:
         self._state_lock = threading.Lock()
         self._cam = BinaryEgoCamera(camera) if camera else None
         self._period, self._detect_period = 1.0 / float(rate_hz), float(detect_period_s)
+        self._recheck_period = float(recheck_period_s)      # 0: never re-detect while locked
+        self.n_reacquired = self.n_dropped = 0
+        self._nc_recheck = 0.0                              # no-camera mode: the last recheck
         self._stop = False
         self.n_bg = 0
         if self._cam is not None:
@@ -345,12 +465,19 @@ class FocusViewSynth:
         if rec["acquired"]:
             logger.info("focus view: %s acquired at window %s (%.0f ms)", rec["target"],
                         rec["window"][:2], rec["ms"])
+        if rec.get("reacquired"):
+            self.n_reacquired += 1
+            logger.warning("focus view: %s RE-ACQUIRED (the detector disagreed with the track) at box %s",
+                           rec["target"], rec["box"][:4] if rec["box"] else None)
+        if rec.get("dropped"):
+            self.n_dropped += 1
+            logger.warning("focus view: %s track left the tube region: dropped, re-detecting", rec["target"])
 
     def _loop(self):
         """Camera mode: the ONLY thread that touches the tracker. Tracking steps hold gpu_lock
         (inference waits at most one ~30 ms step); detection while unlocked does NOT (a holder
         detection is 0.6-2 s and must not stall a request) and is paced to detect_period_s."""
-        applied, last_detect = None, 0.0
+        applied, last_detect, last_recheck = None, 0.0, 0.0
         while not self._stop:
             t0 = time.monotonic()
             try:
@@ -360,13 +487,24 @@ class FocusViewSynth:
                 if frame is not None and sentence is not None:
                     if gen != applied:
                         self.tracker.reset(target_for(sentence))
-                        applied, last_detect = gen, 0.0
+                        applied, last_detect, last_recheck = gen, 0.0, t0
                     rec = None
                     if self.tracker.locked:
+                        reprompt = None
+                        if (self._recheck_period > 0 and target_for(sentence) == "tube"
+                                and t0 - last_recheck >= self._recheck_period):
+                            # the detector again, outside gpu_lock like an acquisition (tube only)
+                            last_recheck = t0
+                            token = self.timing.begin("detection", target_for(sentence), gen)
+                            try:
+                                reprompt = self.tracker.recheck(frame)
+                            finally:
+                                self.timing.end(token)
                         with self.gpu_lock:
                             token = self.timing.begin("tracking", target_for(sentence), gen)
                             try:
-                                rec = self.tracker.step(frame)
+                                rec = (self.tracker.step(frame) if reprompt is None
+                                       else self.tracker.step(frame, reprompt=reprompt))
                             finally:
                                 self.timing.end(token)
                     elif t0 - last_detect >= self._detect_period:
@@ -424,8 +562,14 @@ class FocusViewSynth:
                 if sentence != self._sentence:
                     self.tracker.reset(target)
                     self._sentence, self.last = sentence, None
+                    self._nc_recheck = time.monotonic()
                     logger.info("focus view: target %s for %r", target, sentence[:60])
-                rec = self.tracker.step(np.ascontiguousarray(ego_rgb))
+                frame, reprompt = np.ascontiguousarray(ego_rgb), None
+                if (self._recheck_period > 0 and target == "tube" and self.tracker.locked
+                        and time.monotonic() - self._nc_recheck >= self._recheck_period):
+                    self._nc_recheck = time.monotonic()
+                    reprompt = self.tracker.recheck(frame)
+                rec = self.tracker.step(frame) if reprompt is None else self.tracker.step(frame, reprompt=reprompt)
                 self._log_rec(rec)
                 self.last = rec
         else:
