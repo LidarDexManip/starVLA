@@ -2839,6 +2839,16 @@ DATASET_NAMED_MIXTURES = {
         ("g1-pipette-egofocusvel-p3-447v12-pi05sq224-eval", 1.0,
          "unitree_g1_pipette_egofocusvel_pi05sq224_wrist12rel_lthumbrel_joint14"),
     ],
+    # Pipette tube return P4 R1 (2026-11-16): run E's dirs restricted to the step-4 episodes (aim R3's recipe on step 4),
+    # run E's statistics byte-copied (gigabyte /jy/pipette/outputs/p4-r1/build_p4_dirs.py).
+    "unitree_g1_pipette_egofocusvel_p4_447v12_pi05sq224_train_mix": [
+        ("g1-pipette-egofocusvel-p4-447v12-pi05sq224-train", 1.0,
+         "unitree_g1_pipette_egofocusvel_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocusvel_p4_447v12_pi05sq224_eval_mix": [
+        ("g1-pipette-egofocusvel-p4-447v12-pi05sq224-eval", 1.0,
+         "unitree_g1_pipette_egofocusvel_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
     # Pipette aim R4 (2026-10-27): PI0.5 on the step-3 teleop dirs plus the aim R3 HG-DAgger corrections
     # (jren313/starvla-pipette-aim-r4-pi05-egofocusvel-hgdagger). Training also needs that release's
     # anchor_mask_key loader patch; serving only reads the robot type from here.
@@ -2860,6 +2870,17 @@ DATASET_NAMED_MIXTURES = {
     ],
     "unitree_g1_pipette_egofocuswristvel_p3_insertnew_1028_eval_mix": [
         ("g1-pipette-egofocuswristvel-p3-insertnew-1028-pi05sq224-eval", 1.0,
+         "unitree_g1_pipette_egofocuswristvel_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    # Pipette tube return P4 GP, 3 views (2026-11-18, user: "我们之后都应该默认用wrist camera"; the right hand
+    # was placed so its wrist camera sees the left rack): the 2026-11-17 PICO HG-DAgger successes,
+    # ego + served FOCUS + own wrist_left crop (outputs/p4-gp/build_p4_gp.py, DATA_ROOT data3v_gp1 / data3v_gp12).
+    "unitree_g1_pipette_egofocuswristvel_p4gp_1117_train_mix": [
+        ("g1-pipette-egofocuswristvel-p4gp-1117-pi05sq224-train", 1.0,
+         "unitree_g1_pipette_egofocuswristvel_pi05sq224_wrist12rel_lthumbrel_joint14"),
+    ],
+    "unitree_g1_pipette_egofocuswristvel_p4gp_1117_eval_mix": [
+        ("g1-pipette-egofocuswristvel-p4gp-1117-pi05sq224-eval", 1.0,
          "unitree_g1_pipette_egofocuswristvel_pi05sq224_wrist12rel_lthumbrel_joint14"),
     ],
     "unitree_g1_pipette_egofocus_5task447v12_pi05sq224_train_mix": [
